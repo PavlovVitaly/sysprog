@@ -102,7 +102,7 @@ namespace{
 		return bus->channel_count + bus->availible_channels.size();
 	}
 
-	void suspend_all_with_full_buffer(struct coro_bus *bus, int channel){
+	void suspend_coros_in_channels_with_full_buffer(struct coro_bus *bus, int channel){
 		if(is_full_data_buffer(bus, channel)){
 			wakeup_queue_suspend_this(&bus->channels[channel]->send_queue);
 		}
@@ -117,30 +117,29 @@ namespace{
 	
 }//namespace
 
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 struct coro_bus *
 coro_bus_new(void)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	//coro_bus_errno_set(CORO_BUS_ERR_NOT_IMPLEMENTED);
-	//return NULL;
-
 	return new coro_bus{ .channels = new coro_bus_channel*[10]
 					   , .channel_count = 0
 					   , .availible_channels{}};
 }
 
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 void
 coro_bus_delete(struct coro_bus *bus)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	//(void)bus;
-	for(int i = 0; i < bus->channel_count; ++i){
+	for(int i = 0; i < get_number_available_channels(bus); ++i){
+		if(!is_channel_exists(bus, i)){
+			continue;
+		}
 		coro_bus_channel_close(bus, i);
 	}
 	delete bus;
 }
 
-/* IMPLEMENT THIS FUNCTION */
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 /*
  * One of the tests will force you to reuse the channel
  * descriptors. It means, that if your maximal channel
@@ -174,7 +173,7 @@ coro_bus_channel_open(struct coro_bus *bus, size_t size_limit)
 	return new_channel;
 }
 
-/* IMPLEMENT THIS FUNCTION */
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 /*
  * Be very attentive here. What happens, if the channel is
  * closed while there are coroutines waiting on it? For
@@ -211,13 +210,13 @@ coro_bus_channel_close(struct coro_bus *bus, int channel)
 	rlist_foreach_entry_safe(entry, &bus->channels[channel]->recv_queue.coros, base, tmp)
 	rlist_del_entry(entry, base);
 	
-	//delete bus->channels[channel];
+	delete bus->channels[channel];
 	bus->channels[channel] = nullptr;
 	bus->channel_count--;
 	bus->availible_channels.push(channel);
 }
 
-/* IMPLEMENT THIS FUNCTION */
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 /*
  * Try sending in a loop, until success. If error, then
  * check which one is that. If 'wouldblock', then suspend
@@ -254,11 +253,9 @@ coro_bus_send(struct coro_bus *bus, int channel, unsigned data)
 
 		wakeup_queue_suspend_this(&bus->channels[channel]->send_queue);
 	}
-	
-	return 0;
 }
 
-/* IMPLEMENT THIS FUNCTION */
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 /*
  * Append data if has space. Otherwise 'wouldblock' error.
  * Wakeup the first coro in the recv-queue! To let it know
@@ -282,7 +279,7 @@ coro_bus_try_send(struct coro_bus *bus, int channel, unsigned data)
 	return 0;
 }
 
-/* IMPLEMENT THIS FUNCTION */
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 int
 coro_bus_recv(struct coro_bus *bus, int channel, unsigned *data)
 {
@@ -311,7 +308,7 @@ coro_bus_recv(struct coro_bus *bus, int channel, unsigned *data)
 	return 0;
 }
 
-/* IMPLEMENT THIS FUNCTION */
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 int
 coro_bus_try_recv(struct coro_bus *bus, int channel, unsigned *data)
 {
@@ -336,7 +333,7 @@ coro_bus_try_recv(struct coro_bus *bus, int channel, unsigned *data)
 
 #if NEED_BROADCAST
 
-/* IMPLEMENT THIS FUNCTION */
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 int
 coro_bus_broadcast(struct coro_bus *bus, unsigned data)
 {
@@ -361,14 +358,14 @@ coro_bus_broadcast(struct coro_bus *bus, unsigned data)
 			if(!is_channel_exists(bus, channel)){
 				continue;
 			}
-			suspend_all_with_full_buffer(bus, channel);
+			suspend_coros_in_channels_with_full_buffer(bus, channel);
 		}
 	}
 	
 	return 0;
 }
 
-/* IMPLEMENT THIS FUNCTION */
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 int
 coro_bus_try_broadcast(struct coro_bus *bus, unsigned data)
 {
@@ -401,7 +398,7 @@ coro_bus_try_broadcast(struct coro_bus *bus, unsigned data)
 
 #if NEED_BATCH
 
-/* IMPLEMENT THIS FUNCTION */
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 int
 coro_bus_send_v(struct coro_bus *bus, int channel, const unsigned *data, unsigned count)
 {
@@ -430,7 +427,7 @@ coro_bus_send_v(struct coro_bus *bus, int channel, const unsigned *data, unsigne
 	}
 }
 
-/* IMPLEMENT THIS FUNCTION */
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 int
 coro_bus_try_send_v(struct coro_bus *bus, int channel, const unsigned *data, unsigned count)
 {
@@ -456,7 +453,7 @@ coro_bus_try_send_v(struct coro_bus *bus, int channel, const unsigned *data, uns
 	return static_cast<int>(cnt);
 }
 
-/* IMPLEMENT THIS FUNCTION */
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 int
 coro_bus_recv_v(struct coro_bus *bus, int channel, unsigned *data, unsigned capacity)
 {
@@ -484,7 +481,7 @@ coro_bus_recv_v(struct coro_bus *bus, int channel, unsigned *data, unsigned capa
 	}
 }
 
-/* IMPLEMENT THIS FUNCTION */
+/* STUDENT IMPLEMENTATION OF THIS FUNCTION */
 int
 coro_bus_try_recv_v(struct coro_bus *bus, int channel, unsigned *data, unsigned capacity)
 {
