@@ -1,0 +1,14 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CMake Build Current",
+            "type": "shell",
+            "command": "mkdir -p build && cd build && cmake .. && make",
+            "options": {
+                "cwd": "${fileDirname}" // Запуск сборки из папки проекта (1, 2 и т.д.)
+            },
+            "group": "build"
+        }
+    ]
+}
