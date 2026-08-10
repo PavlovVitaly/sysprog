@@ -115,6 +115,21 @@ execute_single_cmd(const expr& e, std::vector<int>& children_pids)
 	}
 }
 
+struct command{
+	expr e;
+	enum output_type out_type = OUTPUT_TYPE_STDOUT;
+	/** Non-empty if the out type is FILE. */
+	std::string out_file;
+	bool is_background = false;
+}
+
+static void
+execute_piped_cmds(std::vector<std::vector<command>> piped_cmd, std::vector<int>& children_pids){
+	if(piped_cmd.size() == 1 and piped_cmd.front().size() == 1 and piped_cmd.front().front().e.type == EXPR_TYPE_COMMAND){
+		execute_single_cmd(piped_cmd.front().front().e, children_pids);
+	}
+}
+
 static void
 execute_command_line(const struct command_line *line)
 {
@@ -158,19 +173,37 @@ execute_command_line(const struct command_line *line)
 
 	std::vector<int> children_pids;
 
+	std::vector<std::vector<command>> piped_cmd;
+
+	bool is_next = true;
+
 	for (const expr &e : line->exprs) {
 		if (e.type == EXPR_TYPE_COMMAND) {
-			execute_single_cmd(e, children_pids);
+			if(is_next){
+				piped_cmd.push_back(command{e, line->out_type, line->out_file, line->is_background});
+			} else {
+				if(piped_cmd.back().size() == 1 and piped_cmd.back().front().e.cmd == std::nullopt){
+					piped_cmd.back().front().e.cmd = e.cmd;
+				} else {
+					piped_cmd.back().emplace_back(command{expr{piped_cmd.back().front().type, e.cmd}, line->out_type, line->out_file, line->is_background});
+				}
+			}
+			is_next = false;
 		} else if (e.type == EXPR_TYPE_PIPE) {
-			assert(false);
+			is_next = true;
+			continue;
 		} else if (e.type == EXPR_TYPE_AND) {
-			assert(false);
+			piped_cmd.back().emplace_back(command{expr{e.type, std::nullopt}, line->out_type, line->out_file, line->is_background});
+			is_next = false;
 		} else if (e.type == EXPR_TYPE_OR) {
-			assert(false);
+			piped_cmd.back().emplace_back(command{expr{e.type, std::nullopt}, line->out_type, line->out_file, line->is_background});
+			is_next = false;
 		} else {
 			assert(false);
 		}
 	}
+
+	execute_piped_cmds(piped_cmd, children_pids);
 
 	for(auto child_pid : children_pids){
 		int status;
