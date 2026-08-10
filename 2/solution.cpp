@@ -3,10 +3,37 @@
 #include <assert.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include <sys/wait.h>
 #include <limits.h>
 
+
+struct console_command{
+	expr e;
+	enum output_type out_type = OUTPUT_TYPE_STDOUT;
+	/** Non-empty if the out type is FILE. */
+	std::string out_file;
+	bool is_background = false;
+};
+
+static void to_file(enum output_type out_type, const std::string& out_file){
+	if(out_type != OUTPUT_TYPE_STDOUT){ 
+		int file_fd{};
+		if(out_type == OUTPUT_TYPE_FILE_NEW){
+			file_fd = open(out_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		}else{
+			file_fd = open(out_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+		}
+    	dup2(file_fd, STDOUT_FILENO);
+    	close(file_fd);
+	}
+}
+
+static void to_stream(int desc){
+    dup2(desc, STDOUT_FILENO);
+    close(desc);
+}
 
 static void
 execute_change_dir()
@@ -37,20 +64,26 @@ execute_change_dir(const command& cmd)
 }
 
 static void
-execute_echo(const command& cmd)
+execute_echo(const console_command& cmd)
 {
-	assert(cmd.exe == "echo");
-	if(cmd.args.empty()){
+	assert(cmd.e.cmd.has_value());
+	assert(cmd.e.cmd->exe == "echo");
+
+	int original_stdout_fd = dup(STDOUT_FILENO);
+	to_file(cmd.out_type, cmd.out_file);
+
+	if(cmd.e.cmd->args.empty()){
 		return;
 	}
-	for (size_t i = 0; i < cmd.args.size(); ++i) {
+	for (size_t i = 0; i < cmd.e.cmd->args.size(); ++i) {
 		if(i > 0){
 			printf(" ");
 		}
-	    printf("%s", cmd.args[i].c_str());
+	    printf("%s", cmd.e.cmd->args[i].c_str());
 	}
 	printf("\n");
 
+	to_stream(original_stdout_fd);
 }
 
 static void
@@ -77,56 +110,54 @@ execute_exit(const command& cmd)
 }
 
 static void
-execute_cmd_in_forked_process(const command& cmd, std::vector<int>& children_pids)
+execute_cmd_in_forked_process(const console_command& cmd, std::vector<int>& children_pids)
 {
 	auto pid = fork();
 	if (pid < 0) {
     	exit(1);
 	} 
 	else if (pid == 0) {
-		unsigned num_of_args = cmd.args.size() + 2;
+		unsigned num_of_args = cmd.e.cmd->args.size() + 2;
 		char* c_args[num_of_args];
-		c_args[0] = const_cast<char*>(cmd.exe.c_str());
+		c_args[0] = const_cast<char*>(cmd.e.cmd->exe.c_str());
 		unsigned cnt = 1;
-		for (const auto& arg : cmd.args) {
+		for (const auto& arg : cmd.e.cmd->args) {
 		    c_args[cnt] = const_cast<char*>(arg.c_str());
 			++cnt;
 		}
 		c_args[num_of_args - 1] = nullptr;
-		execvp(cmd.exe.c_str(), c_args);
-    	_exit(EXIT_FAILURE); 
+
+		int original_stdout_fd = dup(STDOUT_FILENO);
+		to_file(cmd.out_type, cmd.out_file);
+		
+		execvp(cmd.e.cmd->exe.c_str(), c_args);
+    	
+		to_stream(original_stdout_fd);
+		_exit(EXIT_FAILURE); 
 	}
 	children_pids.push_back(pid);
 }
 
 static void
-execute_single_cmd(const expr& e, std::vector<int>& children_pids)
+execute_single_cmd(const console_command& c, std::vector<int>& children_pids)
 {
-	if(!e.cmd){
+	if(!c.e.cmd){
 		return;
-	}else if(e.cmd->exe == "echo"){
-		execute_echo(*e.cmd);
-	}else if(e.cmd->exe == "cd"){
-		execute_change_dir(*e.cmd);
-	} else if(e.cmd->exe == "exit"){
-		execute_exit(*e.cmd);
+	} else if(c.e.cmd->exe == "echo"){
+		execute_echo(c);
+	}else if(c.e.cmd->exe == "cd"){
+		execute_change_dir(*c.e.cmd);
+	} else if(c.e.cmd->exe == "exit"){
+		execute_exit(*c.e.cmd);
 	} else {
-		execute_cmd_in_forked_process(*e.cmd, children_pids);
+		execute_cmd_in_forked_process(c, children_pids);
 	}
 }
 
-struct command{
-	expr e;
-	enum output_type out_type = OUTPUT_TYPE_STDOUT;
-	/** Non-empty if the out type is FILE. */
-	std::string out_file;
-	bool is_background = false;
-}
-
 static void
-execute_piped_cmds(std::vector<std::vector<command>> piped_cmd, std::vector<int>& children_pids){
+execute_piped_cmds(std::vector<std::vector<console_command>> piped_cmd, std::vector<int>& children_pids){
 	if(piped_cmd.size() == 1 and piped_cmd.front().size() == 1 and piped_cmd.front().front().e.type == EXPR_TYPE_COMMAND){
-		execute_single_cmd(piped_cmd.front().front().e, children_pids);
+		execute_single_cmd(piped_cmd.front().front(), children_pids);
 	}
 }
 
@@ -173,19 +204,19 @@ execute_command_line(const struct command_line *line)
 
 	std::vector<int> children_pids;
 
-	std::vector<std::vector<command>> piped_cmd;
+	std::vector<std::vector<console_command>> piped_cmd;
 
 	bool is_next = true;
 
 	for (const expr &e : line->exprs) {
 		if (e.type == EXPR_TYPE_COMMAND) {
 			if(is_next){
-				piped_cmd.push_back(command{e, line->out_type, line->out_file, line->is_background});
+				piped_cmd.push_back({console_command{e, line->out_type, line->out_file, line->is_background}});
 			} else {
 				if(piped_cmd.back().size() == 1 and piped_cmd.back().front().e.cmd == std::nullopt){
 					piped_cmd.back().front().e.cmd = e.cmd;
 				} else {
-					piped_cmd.back().emplace_back(command{expr{piped_cmd.back().front().type, e.cmd}, line->out_type, line->out_file, line->is_background});
+					piped_cmd.back().emplace_back(console_command{expr{piped_cmd.back().front().e.type, e.cmd}, line->out_type, line->out_file, line->is_background});
 				}
 			}
 			is_next = false;
@@ -193,10 +224,10 @@ execute_command_line(const struct command_line *line)
 			is_next = true;
 			continue;
 		} else if (e.type == EXPR_TYPE_AND) {
-			piped_cmd.back().emplace_back(command{expr{e.type, std::nullopt}, line->out_type, line->out_file, line->is_background});
+			piped_cmd.back().emplace_back(console_command{expr{e.type, std::nullopt}, line->out_type, line->out_file, line->is_background});
 			is_next = false;
 		} else if (e.type == EXPR_TYPE_OR) {
-			piped_cmd.back().emplace_back(command{expr{e.type, std::nullopt}, line->out_type, line->out_file, line->is_background});
+			piped_cmd.back().emplace_back(console_command{expr{e.type, std::nullopt}, line->out_type, line->out_file, line->is_background});
 			is_next = false;
 		} else {
 			assert(false);
