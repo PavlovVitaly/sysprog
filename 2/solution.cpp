@@ -100,6 +100,22 @@ execute_cmd_in_forked_process(const command& cmd, std::vector<int>& children_pid
 }
 
 static void
+execute_single_cmd(const expr& e, std::vector<int>& children_pids)
+{
+	if(!e.cmd){
+		return;
+	}else if(e.cmd->exe == "echo"){
+		execute_echo(*e.cmd);
+	}else if(e.cmd->exe == "cd"){
+		execute_change_dir(*e.cmd);
+	} else if(e.cmd->exe == "exit"){
+		execute_exit(*e.cmd);
+	} else {
+		execute_cmd_in_forked_process(*e.cmd, children_pids);
+	}
+}
+
+static void
 execute_command_line(const struct command_line *line)
 {
 	/* REPLACE THIS CODE WITH ACTUAL COMMAND EXECUTION */
@@ -144,17 +160,7 @@ execute_command_line(const struct command_line *line)
 
 	for (const expr &e : line->exprs) {
 		if (e.type == EXPR_TYPE_COMMAND) {
-			if(!e.cmd){
-				continue;
-			}else if(e.cmd->exe == "echo"){
-				execute_echo(*e.cmd);
-			}else if(e.cmd->exe == "cd"){
-				execute_change_dir(*e.cmd);
-			} else if(e.cmd->exe == "exit"){
-				execute_exit(*e.cmd);
-			} else {
-				execute_cmd_in_forked_process(*e.cmd, children_pids);
-			}
+			execute_single_cmd(e, children_pids);
 		} else if (e.type == EXPR_TYPE_PIPE) {
 			assert(false);
 		} else if (e.type == EXPR_TYPE_AND) {
