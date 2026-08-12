@@ -1,6 +1,7 @@
 #include "parser.h"
 
 #include <assert.h>
+#include <cstdio>
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -18,7 +19,7 @@ struct console_command{
 };
 
 static void to_file(enum output_type out_type, const std::string& out_file){
-	if(out_type != OUTPUT_TYPE_STDOUT){ 
+	if(out_type != OUTPUT_TYPE_STDOUT){
 		int file_fd{};
 		if(out_type == OUTPUT_TYPE_FILE_NEW){
 			file_fd = open(out_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -33,6 +34,18 @@ static void to_file(enum output_type out_type, const std::string& out_file){
 static void to_stream(int desc){
     dup2(desc, STDOUT_FILENO);
     close(desc);
+}
+
+static void boundPipes(int in, int out){
+	if(in != -1){
+		dup2(in, STDIN_FILENO);
+    	close(in);
+	}
+
+	if(out != -1){
+		dup2(out, STDOUT_FILENO);
+    	close(out);
+	}
 }
 
 static void
@@ -82,8 +95,10 @@ execute_echo(const console_command& cmd)
 	    printf("%s", cmd.e.cmd->args[i].c_str());
 	}
 	printf("\n");
+	fflush(stdout);
 
 	to_stream(original_stdout_fd);
+	close(original_stdout_fd);
 }
 
 static void
@@ -110,13 +125,24 @@ execute_exit(const command& cmd)
 }
 
 static void
-execute_cmd_in_forked_process(const console_command& cmd, std::vector<int>& children_pids)
+execute_cmd_in_forked_process(const console_command& cmd, std::vector<int>& children_pids, int in, int out, int current_pipe_read)
 {
 	auto pid = fork();
 	if (pid < 0) {
     	exit(1);
 	} 
 	else if (pid == 0) {
+		boundPipes(in, out);
+
+		if (current_pipe_read != -1) {
+			close(current_pipe_read);
+		}
+
+		if(cmd.e.cmd->exe == "echo"){
+			execute_echo(cmd);
+			_exit(0);
+		}
+		
 		unsigned num_of_args = cmd.e.cmd->args.size() + 2;
 		char* c_args[num_of_args];
 		c_args[0] = const_cast<char*>(cmd.e.cmd->exe.c_str());
@@ -133,31 +159,57 @@ execute_cmd_in_forked_process(const console_command& cmd, std::vector<int>& chil
 		execvp(cmd.e.cmd->exe.c_str(), c_args);
     	
 		to_stream(original_stdout_fd);
+		close(original_stdout_fd);
 		_exit(EXIT_FAILURE); 
 	}
 	children_pids.push_back(pid);
 }
 
 static void
-execute_single_cmd(const console_command& c, std::vector<int>& children_pids)
+execute_single_cmd(const console_command& c, std::vector<int>& children_pids, int in, int out, int current_pipe_read)
 {
 	if(!c.e.cmd){
 		return;
-	} else if(c.e.cmd->exe == "echo"){
-		execute_echo(c);
 	}else if(c.e.cmd->exe == "cd"){
 		execute_change_dir(*c.e.cmd);
 	} else if(c.e.cmd->exe == "exit"){
 		execute_exit(*c.e.cmd);
 	} else {
-		execute_cmd_in_forked_process(c, children_pids);
+		execute_cmd_in_forked_process(c, children_pids, in, out, current_pipe_read);
 	}
 }
 
 static void
 execute_piped_cmds(std::vector<std::vector<console_command>> piped_cmd, std::vector<int>& children_pids){
 	if(piped_cmd.size() == 1 and piped_cmd.front().size() == 1 and piped_cmd.front().front().e.type == EXPR_TYPE_COMMAND){
-		execute_single_cmd(piped_cmd.front().front(), children_pids);
+		execute_single_cmd(piped_cmd.front().front(), children_pids, -1, -1, -1);
+		return;
+	}
+
+	int prev_pipe_read = -1;
+	
+	for(size_t i = 0; i < piped_cmd.size(); ++i){
+		int fd[2] = {-1, -1};
+
+        if (i < piped_cmd.size() - 1) {
+            if (pipe2(fd, O_CLOEXEC) == -1) {
+                perror("pipe failed");
+                exit(1);
+            }
+        }
+
+        int in = prev_pipe_read;
+        int out = (i < piped_cmd.size() - 1) ? fd[1] : -1;
+
+        execute_single_cmd(piped_cmd[i].front(), children_pids, in, out, prev_pipe_read);
+
+        if (prev_pipe_read != -1) {
+            close(prev_pipe_read);
+        }
+		if (fd[1] != -1) {
+            close(fd[1]);
+        }
+        prev_pipe_read = fd[0];
 	}
 }
 
