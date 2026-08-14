@@ -43,6 +43,21 @@ static void boundPipes(int in, int out){
 	}
 }
 
+static int wait_for_pipeline(const std::vector<int>& children_pids) {
+    int last_exit_code = 0;
+    for (auto child_pid : children_pids) {
+        int status = 0;
+        if (waitpid(child_pid, &status, 0) > 0) {
+            if (WIFEXITED(status) && child_pid == children_pids.back()) {
+                last_exit_code = WEXITSTATUS(status);
+            } else if (WIFSIGNALED(status) && child_pid == children_pids.back()) {
+                last_exit_code = 128 + WTERMSIG(status);
+            }
+        }
+    }
+    return last_exit_code;
+}
+
 static void
 execute_change_dir()
 {
@@ -77,9 +92,6 @@ execute_echo(const console_command& cmd)
 	assert(cmd.e.cmd.has_value());
 	assert(cmd.e.cmd->exe == "echo");
 
-	//int original_stdout_fd = dup(STDOUT_FILENO);
-	//to_file(cmd.out_type, cmd.out_file);
-
 	if(cmd.e.cmd->args.empty()){
 		return;
 	}
@@ -91,9 +103,6 @@ execute_echo(const console_command& cmd)
 	}
 	printf("\n");
 	fflush(stdout);
-
-	//to_stream(original_stdout_fd);
-	//close(original_stdout_fd);
 }
 
 static void
@@ -160,13 +169,13 @@ execute_cmd_in_forked_process(const console_command& cmd, std::vector<int>& chil
 }
 
 static void
-execute_single_cmd(const console_command& c, std::vector<int>& children_pids, int in, int out, int current_pipe_read)
+execute_single_cmd(const console_command& c, std::vector<int>& children_pids, int in, int out, int current_pipe_read, bool is_single_cmd = false)
 {
 	if(!c.e.cmd){
 		return;
 	}else if(c.e.cmd->exe == "cd"){
 		execute_change_dir(*c.e.cmd);
-	} else if(c.e.cmd->exe == "exit"){
+	} else if(c.e.cmd->exe == "exit" and is_single_cmd){
 		execute_exit(*c.e.cmd);
 	} else {
 		execute_cmd_in_forked_process(c, children_pids, in, out, current_pipe_read);
@@ -174,10 +183,10 @@ execute_single_cmd(const console_command& c, std::vector<int>& children_pids, in
 }
 
 static void
-execute_piped_cmds(std::vector<std::vector<console_command>> piped_cmd, std::vector<int>& children_pids){
+execute_piped_cmds(std::vector<console_command> piped_cmd, std::vector<int>& children_pids){
 	if(piped_cmd.empty()) return;
-	if(piped_cmd.size() == 1 and piped_cmd.front().size() == 1 and piped_cmd.front().front().e.type == EXPR_TYPE_COMMAND){
-		execute_single_cmd(piped_cmd.front().front(), children_pids, -1, -1, -1);
+	if(piped_cmd.size() == 1 and piped_cmd.size() == 1 and piped_cmd.front().e.type == EXPR_TYPE_COMMAND){
+		execute_single_cmd(piped_cmd.front(), children_pids, -1, -1, -1, true);
 		return;
 	}
 
@@ -196,7 +205,7 @@ execute_piped_cmds(std::vector<std::vector<console_command>> piped_cmd, std::vec
         int in = prev_pipe_read;
         int out = (i < piped_cmd.size() - 1) ? fd[1] : -1;
 
-        execute_single_cmd(piped_cmd[i].front(), children_pids, in, out, fd[0]);
+        execute_single_cmd(piped_cmd[i], children_pids, in, out, fd[0]);
 
         if (prev_pipe_read != -1) {
             close(prev_pipe_read);
@@ -251,31 +260,28 @@ execute_command_line(const struct command_line *line)
 
 	std::vector<int> children_pids;
 
-	std::vector<std::vector<console_command>> piped_cmd;
-
-	bool is_next = true;
+	std::vector<console_command> piped_cmd;
+	
+	bool is_hop = false;
 
 	for (const expr &e : line->exprs) {
 		if (e.type == EXPR_TYPE_COMMAND) {
-			if(is_next){
-				piped_cmd.push_back({console_command{e, line->out_type, line->out_file, line->is_background}});
-			} else {
-				if(piped_cmd.back().size() == 1 and piped_cmd.back().front().e.cmd == std::nullopt){
-					piped_cmd.back().front().e.cmd = e.cmd;
-				} else {
-					piped_cmd.back().emplace_back(console_command{expr{piped_cmd.back().front().e.type, e.cmd}, line->out_type, line->out_file, line->is_background});
-				}
-			}
-			is_next = false;
+			if(is_hop) continue;
+			piped_cmd.push_back({console_command{e, line->out_type, line->out_file, line->is_background}});
 		} else if (e.type == EXPR_TYPE_PIPE) {
-			is_next = true;
 			continue;
 		} else if (e.type == EXPR_TYPE_AND) {
-			piped_cmd.back().emplace_back(console_command{expr{e.type, std::nullopt}, line->out_type, line->out_file, line->is_background});
-			is_next = false;
+			is_hop = false;
+			execute_piped_cmds(piped_cmd, children_pids);
+			auto exit_code = wait_for_pipeline(children_pids);
+			if(exit_code != 0) is_hop = true;
+			piped_cmd.clear();
 		} else if (e.type == EXPR_TYPE_OR) {
-			piped_cmd.back().emplace_back(console_command{expr{e.type, std::nullopt}, line->out_type, line->out_file, line->is_background});
-			is_next = false;
+			is_hop = false;
+			execute_piped_cmds(piped_cmd, children_pids);
+			auto exit_code = wait_for_pipeline(children_pids);
+			if(exit_code == 0) is_hop = true;
+			piped_cmd.clear();
 		} else {
 			assert(false);
 		}

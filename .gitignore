@@ -69,3 +69,5 @@ Testing/
 .cache/
 __pycache__
 testdir/
+
+.vscode/
