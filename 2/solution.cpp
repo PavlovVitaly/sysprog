@@ -31,11 +31,6 @@ static void to_file(enum output_type out_type, const std::string& out_file){
 	}
 }
 
-static void to_stream(int desc){
-    dup2(desc, STDOUT_FILENO);
-    close(desc);
-}
-
 static void boundPipes(int in, int out){
 	if(in != -1){
 		dup2(in, STDIN_FILENO);
@@ -82,8 +77,8 @@ execute_echo(const console_command& cmd)
 	assert(cmd.e.cmd.has_value());
 	assert(cmd.e.cmd->exe == "echo");
 
-	int original_stdout_fd = dup(STDOUT_FILENO);
-	to_file(cmd.out_type, cmd.out_file);
+	//int original_stdout_fd = dup(STDOUT_FILENO);
+	//to_file(cmd.out_type, cmd.out_file);
 
 	if(cmd.e.cmd->args.empty()){
 		return;
@@ -97,8 +92,8 @@ execute_echo(const console_command& cmd)
 	printf("\n");
 	fflush(stdout);
 
-	to_stream(original_stdout_fd);
-	close(original_stdout_fd);
+	//to_stream(original_stdout_fd);
+	//close(original_stdout_fd);
 }
 
 static void
@@ -138,6 +133,10 @@ execute_cmd_in_forked_process(const console_command& cmd, std::vector<int>& chil
 			close(current_pipe_read);
 		}
 
+		if (out == -1) {
+		    to_file(cmd.out_type, cmd.out_file);
+		}
+		
 		if(cmd.e.cmd->exe == "echo"){
 			execute_echo(cmd);
 			_exit(0);
@@ -152,14 +151,9 @@ execute_cmd_in_forked_process(const console_command& cmd, std::vector<int>& chil
 			++cnt;
 		}
 		c_args[num_of_args - 1] = nullptr;
-
-		int original_stdout_fd = dup(STDOUT_FILENO);
-		to_file(cmd.out_type, cmd.out_file);
 		
 		execvp(cmd.e.cmd->exe.c_str(), c_args);
     	
-		to_stream(original_stdout_fd);
-		close(original_stdout_fd);
 		_exit(EXIT_FAILURE); 
 	}
 	children_pids.push_back(pid);
@@ -181,6 +175,7 @@ execute_single_cmd(const console_command& c, std::vector<int>& children_pids, in
 
 static void
 execute_piped_cmds(std::vector<std::vector<console_command>> piped_cmd, std::vector<int>& children_pids){
+	if(piped_cmd.empty()) return;
 	if(piped_cmd.size() == 1 and piped_cmd.front().size() == 1 and piped_cmd.front().front().e.type == EXPR_TYPE_COMMAND){
 		execute_single_cmd(piped_cmd.front().front(), children_pids, -1, -1, -1);
 		return;
@@ -192,7 +187,7 @@ execute_piped_cmds(std::vector<std::vector<console_command>> piped_cmd, std::vec
 		int fd[2] = {-1, -1};
 
         if (i < piped_cmd.size() - 1) {
-            if (pipe2(fd, O_CLOEXEC) == -1) {
+            if (pipe(fd) == -1) {
                 perror("pipe failed");
                 exit(1);
             }
@@ -201,7 +196,7 @@ execute_piped_cmds(std::vector<std::vector<console_command>> piped_cmd, std::vec
         int in = prev_pipe_read;
         int out = (i < piped_cmd.size() - 1) ? fd[1] : -1;
 
-        execute_single_cmd(piped_cmd[i].front(), children_pids, in, out, prev_pipe_read);
+        execute_single_cmd(piped_cmd[i].front(), children_pids, in, out, fd[0]);
 
         if (prev_pipe_read != -1) {
             close(prev_pipe_read);
