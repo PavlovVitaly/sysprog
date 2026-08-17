@@ -43,6 +43,12 @@ static void boundPipes(int in, int out){
 	}
 }
 
+static void close_descriptor(int desc){
+	if (desc != -1) {
+        close(desc);
+    }
+}
+
 static int wait_for_pipeline(std::vector<int>& children_pids, bool is_background = false) {
     if(is_background){
 		children_pids.clear();
@@ -135,6 +141,40 @@ execute_exit(const command& cmd)
 }
 
 static void
+execute_forked_cmd(const console_command& cmd, int in, int out, int current_pipe_read){
+	boundPipes(in, out);
+
+	if (current_pipe_read != -1) {
+		close(current_pipe_read);
+	}
+
+	if (out == -1) {
+	    to_file(cmd.out_type, cmd.out_file);
+	}
+	
+	if(cmd.e.cmd->exe == "echo"){
+		execute_echo(cmd);
+		_exit(0);
+	} else if(cmd.e.cmd->exe == "exit"){
+		execute_exit(*cmd.e.cmd);
+	}
+	
+	unsigned num_of_args = cmd.e.cmd->args.size() + 2;
+	char** c_args = new char*[num_of_args];
+	c_args[0] = const_cast<char*>(cmd.e.cmd->exe.c_str());
+	unsigned cnt = 1;
+	for (const auto& arg : cmd.e.cmd->args) {
+	    c_args[cnt] = const_cast<char*>(arg.c_str());
+		++cnt;
+	}
+	c_args[num_of_args - 1] = nullptr;
+	
+	execvp(cmd.e.cmd->exe.c_str(), c_args);
+ 	
+	_exit(EXIT_FAILURE);
+}
+
+static void
 execute_cmd_in_forked_process(const console_command& cmd, std::vector<int>& children_pids, int in, int out, int current_pipe_read)
 {
 	auto pid = fork();
@@ -142,36 +182,7 @@ execute_cmd_in_forked_process(const console_command& cmd, std::vector<int>& chil
     	exit(1);
 	} 
 	else if (pid == 0) {
-		boundPipes(in, out);
-
-		if (current_pipe_read != -1) {
-			close(current_pipe_read);
-		}
-
-		if (out == -1) {
-		    to_file(cmd.out_type, cmd.out_file);
-		}
-		
-		if(cmd.e.cmd->exe == "echo"){
-			execute_echo(cmd);
-			_exit(0);
-		} else if(cmd.e.cmd->exe == "exit"){
-			execute_exit(*cmd.e.cmd);
-		}
-		
-		unsigned num_of_args = cmd.e.cmd->args.size() + 2;
-		char** c_args = new char*[num_of_args];
-		c_args[0] = const_cast<char*>(cmd.e.cmd->exe.c_str());
-		unsigned cnt = 1;
-		for (const auto& arg : cmd.e.cmd->args) {
-		    c_args[cnt] = const_cast<char*>(arg.c_str());
-			++cnt;
-		}
-		c_args[num_of_args - 1] = nullptr;
-		
-		execvp(cmd.e.cmd->exe.c_str(), c_args);
-    	
-		_exit(EXIT_FAILURE); 
+		execute_forked_cmd(cmd, in, out, current_pipe_read);
 	}
 	children_pids.push_back(pid);
 }
@@ -183,7 +194,7 @@ execute_single_cmd(const console_command& c, std::vector<int>& children_pids, in
 		return;
 	}else if(c.e.cmd->exe == "cd"){
 		execute_change_dir(*c.e.cmd);
-	} else if(c.e.cmd->exe == "exit" and is_single_cmd){
+	} else if(c.e.cmd->exe == "exit" && is_single_cmd){
 		execute_exit(*c.e.cmd);
 	} else {
 		execute_cmd_in_forked_process(c, children_pids, in, out, current_pipe_read);
@@ -193,7 +204,7 @@ execute_single_cmd(const console_command& c, std::vector<int>& children_pids, in
 static void
 execute_piped_cmds(std::vector<console_command> piped_cmd, std::vector<int>& children_pids){
 	if(piped_cmd.empty()) return;
-	if(piped_cmd.size() == 1 and piped_cmd.size() == 1 and piped_cmd.front().e.type == EXPR_TYPE_COMMAND){
+	if(piped_cmd.size() == 1 && piped_cmd.size() == 1 && piped_cmd.front().e.type == EXPR_TYPE_COMMAND){
 		execute_single_cmd(piped_cmd.front(), children_pids, -1, -1, -1, true);
 		return;
 	}
@@ -203,11 +214,9 @@ execute_piped_cmds(std::vector<console_command> piped_cmd, std::vector<int>& chi
 	for(size_t i = 0; i < piped_cmd.size(); ++i){
 		int fd[2] = {-1, -1};
 
-        if (i < piped_cmd.size() - 1) {
-            if (pipe(fd) == -1) {
-                perror("pipe failed");
-                exit(1);
-            }
+        if (i < piped_cmd.size() - 1 && pipe(fd) == -1) {
+            perror("pipe failed");
+            exit(1);
         }
 
         int in = prev_pipe_read;
@@ -215,12 +224,8 @@ execute_piped_cmds(std::vector<console_command> piped_cmd, std::vector<int>& chi
 
         execute_single_cmd(piped_cmd[i], children_pids, in, out, fd[0]);
 
-        if (prev_pipe_read != -1) {
-            close(prev_pipe_read);
-        }
-		if (fd[1] != -1) {
-            close(fd[1]);
-        }
+		close_descriptor(prev_pipe_read);
+		close_descriptor(fd[1]);
         prev_pipe_read = fd[0];
 	}
 }
@@ -228,40 +233,6 @@ execute_piped_cmds(std::vector<console_command> piped_cmd, std::vector<int>& chi
 static int
 execute_command_line(const struct command_line *line)
 {
-	/* REPLACE THIS CODE WITH ACTUAL COMMAND EXECUTION */
-
-	//assert(line != NULL);
-	//printf("================================\n");
-	//printf("Command line:\n");
-	//printf("Is background: %d\n", (int)line->is_background);
-	//printf("Output: ");
-	//if (line->out_type == OUTPUT_TYPE_STDOUT) {
-	//	printf("stdout\n");
-	//} else if (line->out_type == OUTPUT_TYPE_FILE_NEW) {
-	//	printf("new file - \"%s\"\n", line->out_file.c_str());
-	//} else if (line->out_type == OUTPUT_TYPE_FILE_APPEND) {
-	//	printf("append file - \"%s\"\n", line->out_file.c_str());
-	//} else {
-	//	assert(false);
-	//}
-	//printf("Expressions:\n");
-	//for (const expr &e : line->exprs) {
-	//	if (e.type == EXPR_TYPE_COMMAND) {
-	//		printf("\tCommand: %s", e.cmd->exe.c_str());
-	//		for (const std::string& arg : e.cmd->args)
-	//			printf(" %s", arg.c_str());
-	//		printf("\n");
-	//	} else if (e.type == EXPR_TYPE_PIPE) {
-	//		printf("\tPIPE\n");
-	//	} else if (e.type == EXPR_TYPE_AND) {
-	//		printf("\tAND\n");
-	//	} else if (e.type == EXPR_TYPE_OR) {
-	//		printf("\tOR\n");
-	//	} else {
-	//		assert(false);
-	//	}
-	//}
-
 	if(line == NULL){
 		return 0;
 	}
@@ -279,17 +250,11 @@ execute_command_line(const struct command_line *line)
 			piped_cmd.push_back({console_command{e, line->out_type, line->out_file, line->is_background}});
 		} else if (e.type == EXPR_TYPE_PIPE) {
 			continue;
-		} else if (e.type == EXPR_TYPE_AND) {
-			is_hop = false;
+		} else if (e.type == EXPR_TYPE_AND || e.type == EXPR_TYPE_OR) {
 			execute_piped_cmds(piped_cmd, children_pids);
 			last_exit_code = wait_for_pipeline(children_pids, line->is_background);
-			if(last_exit_code != 0) is_hop = true;
-			piped_cmd.clear();
-		} else if (e.type == EXPR_TYPE_OR) {
-			is_hop = false;
-			execute_piped_cmds(piped_cmd, children_pids);
-			last_exit_code = wait_for_pipeline(children_pids, line->is_background);
-			if(last_exit_code == 0) is_hop = true;
+			is_hop = (e.type == EXPR_TYPE_AND && last_exit_code != 0)
+				|| (e.type == EXPR_TYPE_OR && last_exit_code == 0);
 			piped_cmd.clear();
 		} else {
 			assert(false);
