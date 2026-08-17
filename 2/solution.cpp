@@ -43,8 +43,13 @@ static void boundPipes(int in, int out){
 	}
 }
 
-static int wait_for_pipeline(const std::vector<int>& children_pids) {
-    int last_exit_code = 0;
+static int wait_for_pipeline(std::vector<int>& children_pids, bool is_background = false) {
+    if(is_background){
+		children_pids.clear();
+		return 0;
+	}
+
+	int last_exit_code = 0;
     for (auto child_pid : children_pids) {
         int status = 0;
         if (waitpid(child_pid, &status, 0) > 0) {
@@ -55,6 +60,7 @@ static int wait_for_pipeline(const std::vector<int>& children_pids) {
             }
         }
     }
+	children_pids.clear();
     return last_exit_code;
 }
 
@@ -149,10 +155,12 @@ execute_cmd_in_forked_process(const console_command& cmd, std::vector<int>& chil
 		if(cmd.e.cmd->exe == "echo"){
 			execute_echo(cmd);
 			_exit(0);
+		} else if(cmd.e.cmd->exe == "exit"){
+			execute_exit(*cmd.e.cmd);
 		}
 		
 		unsigned num_of_args = cmd.e.cmd->args.size() + 2;
-		char* c_args[num_of_args];
+		char** c_args = new char*[num_of_args];
 		c_args[0] = const_cast<char*>(cmd.e.cmd->exe.c_str());
 		unsigned cnt = 1;
 		for (const auto& arg : cmd.e.cmd->args) {
@@ -217,7 +225,7 @@ execute_piped_cmds(std::vector<console_command> piped_cmd, std::vector<int>& chi
 	}
 }
 
-static void
+static int
 execute_command_line(const struct command_line *line)
 {
 	/* REPLACE THIS CODE WITH ACTUAL COMMAND EXECUTION */
@@ -255,7 +263,7 @@ execute_command_line(const struct command_line *line)
 	//}
 
 	if(line == NULL){
-		return;
+		return 0;
 	}
 
 	std::vector<int> children_pids;
@@ -263,6 +271,7 @@ execute_command_line(const struct command_line *line)
 	std::vector<console_command> piped_cmd;
 	
 	bool is_hop = false;
+	int last_exit_code = 0;
 
 	for (const expr &e : line->exprs) {
 		if (e.type == EXPR_TYPE_COMMAND) {
@@ -273,14 +282,14 @@ execute_command_line(const struct command_line *line)
 		} else if (e.type == EXPR_TYPE_AND) {
 			is_hop = false;
 			execute_piped_cmds(piped_cmd, children_pids);
-			auto exit_code = wait_for_pipeline(children_pids);
-			if(exit_code != 0) is_hop = true;
+			last_exit_code = wait_for_pipeline(children_pids, line->is_background);
+			if(last_exit_code != 0) is_hop = true;
 			piped_cmd.clear();
 		} else if (e.type == EXPR_TYPE_OR) {
 			is_hop = false;
 			execute_piped_cmds(piped_cmd, children_pids);
-			auto exit_code = wait_for_pipeline(children_pids);
-			if(exit_code == 0) is_hop = true;
+			last_exit_code = wait_for_pipeline(children_pids, line->is_background);
+			if(last_exit_code == 0) is_hop = true;
 			piped_cmd.clear();
 		} else {
 			assert(false);
@@ -289,23 +298,25 @@ execute_command_line(const struct command_line *line)
 
 	execute_piped_cmds(piped_cmd, children_pids);
 
-	for(auto child_pid : children_pids){
-		int status;
-		waitpid(child_pid, &status, 0);	
+	if (!children_pids.empty()) {
+		last_exit_code = wait_for_pipeline(children_pids, line->is_background);
 	}
+	return last_exit_code;
 }
 
 int
 main(void)
 {
-	const size_t buf_size = 1024;
+	const size_t buf_size = 512 * 1024;
 	char buf[buf_size];
 	int rc;
 	struct parser *p = parser_new();
+	int last_exit_code = 0;
 	while ((rc = read(STDIN_FILENO, buf, buf_size)) > 0) {
 		parser_feed(p, buf, rc);
 		struct command_line *line = NULL;
 		while (true) {
+			while (waitpid(-1, nullptr, WNOHANG) > 0);
 			enum parser_error err = parser_pop_next(p, &line);
 			if (err == PARSER_ERR_NONE && line == NULL)
 				break;
@@ -313,10 +324,10 @@ main(void)
 				printf("Error: %d\n", (int)err);
 				continue;
 			}
-			execute_command_line(line);
+			last_exit_code = execute_command_line(line);
 			delete line;
 		}
 	}
 	parser_delete(p);
-	return 0;
+	return last_exit_code;
 }
