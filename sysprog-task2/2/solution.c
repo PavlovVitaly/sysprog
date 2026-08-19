@@ -294,8 +294,16 @@ execute_forked_cmd(const struct expr* e
 	} else if(strcmp(e->cmd.exe, "exit") == 0){
 		execute_exit(&e->cmd);
 	}
-	
-	execvp(e->cmd.exe, e->cmd.args);
+
+	size_t num_of_args = e->cmd.arg_count + 2;
+	char** new_args = malloc(num_of_args * sizeof(char*));
+	new_args[0] = strdup(e->cmd.exe);
+	for(size_t i = 0; i < e->cmd.arg_count; ++i){
+		new_args[i + 1] = strdup(e->cmd.args[i]);
+	}
+	new_args[num_of_args - 1] = NULL;
+
+	execvp(e->cmd.exe, new_args);
  	
 	_exit(EXIT_FAILURE);
 }
