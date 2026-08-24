@@ -85,23 +85,24 @@ struct command_list {
 };
 
 static void copy_expr(struct expr* des, const struct expr* src){
-	des->type = src->type;
-	des->cmd.args = malloc(src->cmd.arg_count * sizeof(char*));
+	memcpy(des, src, sizeof(struct expr));
+	des->cmd.args = malloc((src->cmd.arg_count + 1) * sizeof(char*));
 	for(size_t i = 0; i < src->cmd.arg_count; ++i){
 		des->cmd.args[i] = strdup(src->cmd.args[i]);
 	}
 	des->cmd.args[src->cmd.arg_count] = NULL; 
 	des->cmd.exe = strdup(src->cmd.exe);
-	des->cmd.arg_count = src->cmd.arg_count;
-	des->cmd.arg_capacity = src->cmd.arg_capacity;
 	des->next = NULL;
 }
 
 static void
 push_back(struct command_list* line, const struct expr* e){
-	struct expr* new_e = malloc(sizeof(struct expr));
+	struct expr* new_e = calloc(1, sizeof(struct expr));
+	if (!new_e) {
+		exit(1);
+	}
 	copy_expr(new_e, e);
-	new_e->next = NULL;
+
 	if(!line->head){
 		line->head = new_e;
 		line->tail = line->head;
@@ -113,6 +114,10 @@ push_back(struct command_list* line, const struct expr* e){
 
 static void
 clear_list(struct command_list* line){
+	if(!line || !line->head){
+		if(line) line->tail = NULL;
+		return;
+	}
 	if(line->head == line->tail){
 		free(line->head->cmd.exe);
 		if(line->head->cmd.args){
@@ -122,6 +127,8 @@ clear_list(struct command_list* line){
 			free(line->head->cmd.args);
 		}
 		free(line->head);
+		line->head = NULL;
+		line->tail = NULL;
 		return;
 	}
 	
@@ -137,6 +144,8 @@ clear_list(struct command_list* line){
 		free(line->head);
 		line->head = next;
 	}
+	line->head = NULL;
+	line->tail = NULL;
 }
 
 static bool
@@ -323,6 +332,8 @@ execute_cmd_in_forked_process(const struct expr* cmd
 	else if (pid == 0) {
 		execute_forked_cmd(cmd, property, in, out, current_pipe_read);
 	}
+	close_descriptor(in);
+	close_descriptor(out);
 	pid_vector_append(children_pids, pid);
 }
 
@@ -396,9 +407,11 @@ execute_command_line(const struct command_line *line)
 		return 0;
 	}
 
-	struct pid_vector children_pids = {0};
-
-	struct command_list piped_cmd = {0};
+	struct pid_vector children_pids;
+	struct command_list piped_cmd;
+	memset(&children_pids, 0, sizeof(children_pids));
+	memset(&piped_cmd, 0, sizeof(piped_cmd));
+	
 	piped_cmd.property.is_background = line->is_background;
 	piped_cmd.property.out_file = line->out_file;
 	piped_cmd.property.out_type = line->out_type;
