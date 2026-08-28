@@ -206,6 +206,7 @@ test_io(void)
 	bool ok = true;
 	for (size_t i = 0; i < some_size && ok; ++i)
 		ok = ok && buffer[i] == (char)('a' + i % ('z' - 'a' + 1));
+
 	unit_check(ok, "data is correct");
 	/*
 	 * Make sure on overwrite the blocks are not lost or anything.

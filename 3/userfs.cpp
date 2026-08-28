@@ -4,7 +4,9 @@
 
 #include <stddef.h>
 #include <string>
+#include <sys/types.h>
 #include <vector>
+#include <string.h>
 
 enum {
 	BLOCK_SIZE = 512,
@@ -38,6 +40,8 @@ struct file {
 	rlist in_file_list = RLIST_LINK_INITIALIZER;
 
 	/* PUT HERE OTHER MEMBERS */
+	size_t size = 0;
+	bool is_deleted = false;
 };
 
 /**
@@ -48,9 +52,13 @@ struct file {
 static rlist file_list = RLIST_HEAD_INITIALIZER(file_list);
 
 struct filedesc {
-	file *atfile;
+	file *atfile{};
 
 	/* PUT HERE OTHER MEMBERS */
+	block *block_ptr{};
+	size_t block_num{};
+	size_t offset{};
+	int mode{};
 };
 
 /**
@@ -67,56 +75,276 @@ ufs_errno()
 	return ufs_error_code;
 }
 
+static file *create_ufs_file(const std::string& filename){
+	file *new_file = new file{};
+	new_file->name = filename;
+	block *new_block = new block{};
+	rlist_add_tail_entry(&new_file->blocks, new_block, in_block_list);
+	rlist_add_tail_entry(&file_list, new_file, in_file_list);
+	return new_file;
+}
+
+static file *get_ufs_file(const std::string& filename){
+	rlist *item{};
+	rlist_foreach(item, &file_list){
+		file* f = rlist_entry(item, struct file, in_file_list);
+		if(f->name == filename && !f->is_deleted) return f;
+	}
+	return nullptr;
+}
+
+static filedesc *create_ufs_filedesc(file *opened_file, int flags){
+	filedesc *new_filedesc = new filedesc{};
+	new_filedesc->mode = flags;
+	block* blk = rlist_first_entry(&opened_file->blocks, struct block, in_block_list);
+	new_filedesc->block_ptr = blk;
+	new_filedesc->offset = 0;
+	new_filedesc->block_num = 0;
+	new_filedesc->atfile = opened_file;
+	opened_file->refs++;
+	return new_filedesc;
+}
+
+static void add_new_empty_block(filedesc *fd){
+	block *new_block = new block{};
+	rlist_add_tail_entry(&fd->atfile->blocks, new_block, in_block_list);
+	fd->block_ptr = new_block;
+	fd->block_num++;
+	fd->offset = 0;
+}
+
+static void update_file_size(filedesc *fd){
+	size_t new_file_size = static_cast<size_t>(BLOCK_SIZE) * fd->block_num + fd->offset;
+	if(new_file_size > fd->atfile->size){
+		fd->atfile->size = new_file_size;
+	}
+}
+
+static filedesc *get_filedesc(int fd){
+	if(fd < 0 || static_cast<size_t>(fd) >= file_descriptors.size()) {
+		return nullptr;
+	}
+	filedesc *desc = file_descriptors[fd];
+	if(!desc) return nullptr;
+	
+	size_t sz = desc->block_num * static_cast<size_t>(BLOCK_SIZE) + desc->offset;
+	if(sz > desc->atfile->size){
+		desc->offset = desc->atfile->size % static_cast<size_t>(BLOCK_SIZE);
+		desc->block_num = desc->atfile->size / static_cast<size_t>(BLOCK_SIZE);
+	}
+
+	if(!rlist_empty(&desc->atfile->blocks)){
+		size_t cnt{};
+		struct block *blk{};
+		rlist_foreach_entry(blk, &desc->atfile->blocks, in_block_list){
+			desc->block_ptr = blk;
+			if(cnt == desc->block_num){
+				break;
+			}
+			++cnt;
+		}
+	} else {
+		block *new_block = new block{};
+		memset(new_block->memory, 0, BLOCK_SIZE);
+		rlist_add_tail_entry(&desc->atfile->blocks, new_block, in_block_list);
+		desc->block_ptr = new_block;
+		desc->block_num = 0;
+		desc->offset = 0;
+	}
+	return desc;
+}
+
 int
 ufs_open(const char *filename, int flags)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)filename;
-	(void)flags;
-	(void)file_list;
-	(void)file_descriptors;
-	ufs_error_code = UFS_ERR_NOT_IMPLEMENTED;
-	return -1;
+	file* opened_file = get_ufs_file(filename);
+	if((flags & UFS_CREATE) && !opened_file){
+		opened_file = create_ufs_file(filename);
+	}
+	if(!opened_file) {
+		ufs_error_code = UFS_ERR_NO_FILE;
+		return -1;
+	}
+
+#if NEED_OPEN_FLAGS
+	if(flags == UFS_CREATE) flags |= UFS_READ_WRITE;
+#endif
+
+	int fd{-1};
+	for(; static_cast<size_t>(fd) < file_descriptors.size(); ++fd){
+		if(file_descriptors[fd + 1] == nullptr){
+			++fd;
+			break;
+		}
+	}
+
+	filedesc *desc = create_ufs_filedesc(opened_file, flags);
+	if(fd < 0){
+		file_descriptors.push_back(desc);
+		return file_descriptors.size() - 1;
+	}
+	
+	file_descriptors[fd] = desc;
+	return fd;
 }
 
 ssize_t
 ufs_write(int fd, const char *buf, size_t size)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)fd;
-	(void)buf;
-	(void)size;
-	ufs_error_code = UFS_ERR_NOT_IMPLEMENTED;
-	return -1;
+	filedesc* desc = get_filedesc(fd);
+	if(!desc) {
+		ufs_error_code = UFS_ERR_NO_FILE;
+		return -1;
+	}
+
+#if NEED_OPEN_FLAGS
+	if(!(desc->mode & UFS_WRITE_ONLY) && desc->mode != 0){
+		ufs_error_code = UFS_ERR_NO_PERMISSION;
+		return -1;
+	}
+#endif
+
+	size_t current_pos = desc->block_num * BLOCK_SIZE + desc->offset;
+	if (current_pos + size > MAX_FILE_SIZE) {
+		ufs_error_code = UFS_ERR_NO_MEM;
+		return -1;
+	}
+
+	if(size <= BLOCK_SIZE - desc->offset){
+		memcpy((desc->block_ptr->memory + desc->offset), buf, size);
+		desc->offset += size;
+		update_file_size(desc);
+		return size;
+	}
+
+	size_t total_size{BLOCK_SIZE - desc->offset};
+	size_t new_size{};
+	memcpy((desc->block_ptr->memory + desc->offset), buf, BLOCK_SIZE - desc->offset);
+	desc->offset = BLOCK_SIZE;
+
+	while(total_size < size){
+		if (desc->offset == BLOCK_SIZE) {
+			if(desc->block_ptr->in_block_list.next == &desc->atfile->blocks){
+				add_new_empty_block(desc);
+			} else {
+				block* blk = rlist_entry(desc->block_ptr->in_block_list.next, struct block, in_block_list);	
+				desc->block_ptr = blk;
+				desc->block_num++;
+				desc->offset = 0;
+			}
+		}
+
+		size_t diff{size - total_size};
+		new_size = static_cast<size_t>(BLOCK_SIZE - desc->offset) >= diff ? diff : static_cast<size_t>(BLOCK_SIZE - desc->offset);
+		
+		memcpy(desc->block_ptr->memory + desc->offset, buf + total_size, new_size);
+		desc->offset += new_size;
+		total_size += new_size;	
+	}
+
+	update_file_size(desc);
+	return total_size;
 }
 
 ssize_t
 ufs_read(int fd, char *buf, size_t size)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)fd;
-	(void)buf;
-	(void)size;
-	ufs_error_code = UFS_ERR_NOT_IMPLEMENTED;
-	return -1;
+	filedesc* desc = get_filedesc(fd);
+	if(!desc) {
+		ufs_error_code = UFS_ERR_NO_FILE;
+		return -1;
+	}
+
+#if NEED_OPEN_FLAGS
+	if(!(desc->mode & UFS_READ_ONLY) && desc->mode != 0){
+		ufs_error_code = UFS_ERR_NO_PERMISSION;
+		return -1;
+	}
+#endif
+
+	size_t rsize = std::min(desc->atfile->size - (static_cast<size_t>(BLOCK_SIZE) * desc->block_num) - desc->offset, size);
+	if(BLOCK_SIZE - desc->offset >= rsize){
+		if(rsize == 0){
+			return 0;
+		}
+		memcpy(buf, (desc->block_ptr->memory + desc->offset), rsize);
+		desc->offset += rsize;
+		return rsize;
+	}
+
+	size_t total_size{BLOCK_SIZE - desc->offset};
+	if(rsize == 0){
+		return 0;
+	}
+	memcpy(buf, (desc->block_ptr->memory + desc->offset), BLOCK_SIZE - desc->offset);
+	desc->offset = BLOCK_SIZE;
+
+	while(total_size < rsize){
+		if (desc->offset == BLOCK_SIZE) {
+			if (desc->block_ptr->in_block_list.next == &desc->atfile->blocks) {
+				break;
+			}
+			desc->block_ptr = rlist_entry(desc->block_ptr->in_block_list.next, struct block, in_block_list);
+			desc->block_num++;
+			desc->offset = 0;
+		}
+
+		size_t diff{rsize - total_size};
+		size_t blk_sz = static_cast<size_t>(BLOCK_SIZE - desc->offset) >= diff ? diff : static_cast<size_t>(BLOCK_SIZE - desc->offset);
+		
+		memcpy(buf + total_size, desc->block_ptr->memory + desc->offset, blk_sz);
+		desc->offset += blk_sz;
+		total_size += blk_sz;
+	}
+
+	return total_size;
 }
+
 
 int
 ufs_close(int fd)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)fd;
-	ufs_error_code = UFS_ERR_NOT_IMPLEMENTED;
-	return -1;
+	filedesc* desc = get_filedesc(fd);
+	if(!desc) {
+		ufs_error_code = UFS_ERR_NO_FILE;
+		return -1;
+	}
+	file *f = desc->atfile;
+	f->refs--;
+	
+	delete desc;
+	file_descriptors[fd] = nullptr;
+	
+	if(f && f->refs == 0 && f->is_deleted){
+		struct block *tmp{};
+		struct block *blk{};
+		rlist_foreach_entry_safe(blk, &f->blocks, in_block_list, tmp){
+			rlist_del_entry(blk, in_block_list);
+			delete blk;
+		}
+		delete f;
+	}
+	return 0;
 }
 
 int
 ufs_delete(const char *filename)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)filename;
-	ufs_error_code = UFS_ERR_NOT_IMPLEMENTED;
-	return -1;
+	file* opened_file = get_ufs_file(filename);
+	if(!opened_file || opened_file->is_deleted) return 0;
+	opened_file->is_deleted = true;
+	rlist_del_entry(opened_file, in_file_list);
+
+	if(opened_file->refs == 0) {
+		struct block *tmp{};
+		struct block *blk{};
+		rlist_foreach_entry_safe(blk, &opened_file->blocks, in_block_list, tmp){
+			rlist_del_entry(blk, in_block_list);
+			delete blk;
+		}
+		delete opened_file;
+	}
+	return 0;
 }
 
 #if NEED_RESIZE
@@ -124,11 +352,69 @@ ufs_delete(const char *filename)
 int
 ufs_resize(int fd, size_t new_size)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)fd;
-	(void)new_size;
-	ufs_error_code = UFS_ERR_NOT_IMPLEMENTED;
-	return -1;
+	filedesc* desc = get_filedesc(fd);
+	if(!desc) {
+		ufs_error_code = UFS_ERR_NO_FILE;
+		return -1;
+	}
+
+	if (new_size > MAX_FILE_SIZE) {
+		ufs_error_code = UFS_ERR_NO_MEM;
+		return -1;
+	}
+
+#if NEED_OPEN_FLAGS
+	if(!(desc->mode & UFS_READ_WRITE) && desc->mode != 0){
+		ufs_error_code = UFS_ERR_NO_PERMISSION;
+		return -1;
+	}
+#endif
+
+	file *f = desc->atfile;
+
+	if(f->size == new_size) return 0;
+
+	if(f->size < new_size){
+		size_t sz = f->size - (f->size % static_cast<size_t>(BLOCK_SIZE)) + static_cast<size_t>(BLOCK_SIZE);
+		if(new_size <= sz){
+			f->size = new_size;
+			return 0;
+		}
+		
+		while(sz < new_size){
+			block *new_block = new block{};
+			memset(new_block->memory, 0, BLOCK_SIZE);
+			rlist_add_tail_entry(&f->blocks, new_block, in_block_list);
+			sz += static_cast<size_t>(BLOCK_SIZE);
+		}
+		f->size = new_size;
+		return 0;
+	}
+
+	size_t sz = f->size - (f->size % static_cast<size_t>(BLOCK_SIZE));
+	if(sz <= new_size){
+		f->size = new_size;
+		return 0;
+	}
+	sz += static_cast<size_t>(BLOCK_SIZE);
+	
+	block *blk = rlist_last_entry(&f->blocks, struct block, in_block_list);
+	
+	while(sz > new_size){
+		rlist *tmp = blk->in_block_list.prev;
+		
+		if (tmp == &f->blocks) {
+			break;
+		}
+
+		rlist_del_entry(blk, in_block_list);
+		delete blk;
+		
+		blk = rlist_entry(tmp, struct block, in_block_list);
+		sz -= static_cast<size_t>(BLOCK_SIZE);
+	}
+	f->size = new_size;
+	return 0;
 }
 
 #endif
@@ -145,4 +431,24 @@ ufs_destroy(void)
 	 * The recommended way of freeing the memory is to swap()
 	 * the vector with a temporary empty vector.
 	 */
+	for(int fd = 0; static_cast<size_t>(fd) < file_descriptors.size(); ++fd){
+		ufs_close(fd);
+	}
+	std::vector<filedesc*> tmp;
+	std::swap(file_descriptors, tmp);
+
+	file *file_item, *tmp_file;
+	rlist_foreach_entry_safe(file_item, &file_list, in_file_list, tmp_file) {
+		file *f = rlist_entry(file_item, struct file, in_file_list);
+		
+		struct block *tmp{};
+		struct block *blk{};
+		rlist_foreach_entry_safe(blk, &f->blocks, in_block_list, tmp){
+			rlist_del_entry(blk, in_block_list);
+			delete blk;
+		}
+		
+		rlist_del_entry(f, in_file_list);
+		delete f;
+	}
 }
