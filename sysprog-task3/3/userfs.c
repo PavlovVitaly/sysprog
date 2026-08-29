@@ -233,13 +233,18 @@ ufs_open(const char *filename, int flags)
 	return fd;
 }
 
-static void
-create_init_block(struct filedesc *fd){
+static struct block
+*create_block(){
 	struct block *new_block = malloc(sizeof(struct block));
 	new_block->next = NULL;
 	new_block->prev = NULL;
 	new_block->occupied = 0;
 	new_block->memory = calloc(BLOCK_SIZE, sizeof(char));
+	return new_block;
+}
+static void
+create_init_block(struct filedesc *fd){
+	struct block *new_block = create_block();
 	fd->file->block_list = new_block;
 	fd->file->last_block = new_block;
 	fd->block_ptr = new_block;
@@ -249,13 +254,10 @@ create_init_block(struct filedesc *fd){
 
 static void
 add_new_empty_block(struct filedesc *fd){
-	struct block *new_block = malloc(sizeof(struct block));
-	new_block->next = NULL;
+	struct block *new_block = create_block();;
 	new_block->prev = fd->file->last_block;
 	fd->file->last_block->next = new_block;
 	fd->file->last_block = new_block;
-	new_block->occupied = 0;
-	new_block->memory = calloc(BLOCK_SIZE, sizeof(char));
 	fd->block_ptr = new_block;
 	fd->block_num++;
 	fd->offset = 0;
@@ -477,11 +479,8 @@ expand_file(struct file *f, size_t new_size){
 	}
 		
 	while(sz < new_size){
-		struct block *new_block = malloc(sizeof(struct block));
-		new_block->next = NULL;
+		struct block *new_block = create_block();;
 		new_block->prev = f->last_block;
-		new_block->occupied = 0;
-		new_block->memory = calloc(BLOCK_SIZE, sizeof(char));
 		f->last_block->next = new_block;
 		f->last_block = new_block;
 		sz += BLOCK_SIZE;
