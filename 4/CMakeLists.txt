@@ -9,16 +9,17 @@ set(COMMON_FLAGS
     -Wall
     -Wno-gnu-folding-constant
     -g
+#    -fsanitize=thread
 )
 add_compile_options(${COMMON_FLAGS})
 
 option(ENABLE_LEAK_CHECKS
     "Enable memory leak checks with heap_help"
-    OFF)
+    ON)
 
 option(ENABLE_GLOB_SEARCH
     "Enable compilation of all the files, not just the preselected ones"
-    OFF)
+    ON)
 
 set(UTILS_DIR ${CMAKE_SOURCE_DIR}/../utils)
 set(UTILS_SOURCES ${UTILS_DIR}/unit.cpp)
@@ -42,5 +43,7 @@ else()
     list(APPEND TEST_SOURCES ${UTILS_SOURCES})
     add_executable(test ${TEST_SOURCES})
 endif()
+
+#target_link_options(test PRIVATE -fsanitize=thread)
 
 target_link_libraries(test pthread)
