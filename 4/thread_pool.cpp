@@ -122,14 +122,14 @@ static void* worker_func(void* arg){
 		{
 			std::lock_guard l(task->mtx);
 			--(*data->waiting_threads);
-			task->status = THREAD_TASK_RUNNING;
+			task->status.store(THREAD_TASK_RUNNING, std::memory_order_release);
 		}
 		
 		task->function();
 
 		{
 			std::lock_guard l(task->mtx);
-			task->status = THREAD_TASK_FINISHED;
+			task->status.store(THREAD_TASK_FINISHED, std::memory_order_release);
 			++(*data->waiting_threads);
 			detached = task->is_detached;
 			if(!detached) {
@@ -159,9 +159,9 @@ int
 thread_pool_push_task(struct thread_pool *pool, struct thread_task *task)
 {
 	if(pool->waiting_threads == 0 && pool->active_threads < pool->max_threads) start_new_worker(pool);
-	task->status = THREAD_TASK_WAITING;
+	task->status.store(THREAD_TASK_WAITING, std::memory_order_release);
 	if(!push(&pool->tqueue, task)){
-		task->status = THREAD_TASK_IDLE; 
+		task->status.store(THREAD_TASK_IDLE, std::memory_order_release);
 		return TPOOL_ERR_TOO_MANY_TASKS;
 	}
 	return 0;
@@ -172,30 +172,30 @@ thread_task_new(struct thread_task **task, const thread_task_f &function)
 {
 	*task = new thread_task();
 	(*task)->function = function;
-	(*task)->status = THREAD_TASK_IDLE;
+	(*task)->status.store(THREAD_TASK_IDLE, std::memory_order_release);
 	return 0;
 }
 
 bool
 thread_task_is_finished(const struct thread_task *task)
 {
-	return task->status == THREAD_TASK_FINISHED;
+	return task->status.load(std::memory_order_acquire) == THREAD_TASK_FINISHED;
 }
 
 bool
 thread_task_is_running(const struct thread_task *task)
 {
-	return task->status == THREAD_TASK_RUNNING;
+	return task->status.load(std::memory_order_acquire) == THREAD_TASK_RUNNING;
 }
 
 int
 thread_task_join(struct thread_task *task)
 {
 	if(!task) return 0;
-	if(task->status == THREAD_TASK_IDLE) return TPOOL_ERR_TASK_NOT_PUSHED;
+	if(task->status.load(std::memory_order_acquire) == THREAD_TASK_IDLE) return TPOOL_ERR_TASK_NOT_PUSHED;
 	std::unique_lock l(task->mtx);
 	if(task->is_detached) return 0;
-	task->cv.wait(l, [task](){return task->status == THREAD_TASK_FINISHED;});
+	task->cv.wait(l, [task](){return task->status.load(std::memory_order_acquire) == THREAD_TASK_FINISHED;});
 	return 0;
 }
 
@@ -205,12 +205,12 @@ int
 thread_task_timed_join(struct thread_task *task, double timeout)
 {
 	if(!task) return 0;
-	if(task->status == THREAD_TASK_IDLE) return TPOOL_ERR_TASK_NOT_PUSHED;
+	if(task->status.load(std::memory_order_acquire) == THREAD_TASK_IDLE) return TPOOL_ERR_TASK_NOT_PUSHED;
 	std::unique_lock l(task->mtx);
 	if(task->is_detached) return 0;
 	auto res = task->cv.wait_for(l
 		, std::chrono::duration<double>(timeout)
-		,[task](){return task->status == THREAD_TASK_FINISHED;});
+		,[task](){return task->status.load(std::memory_order_acquire) == THREAD_TASK_FINISHED;});
 	if(!res) return TPOOL_ERR_TIMEOUT;
 	return 0;
 }
@@ -220,8 +220,8 @@ thread_task_timed_join(struct thread_task *task, double timeout)
 int
 thread_task_delete(struct thread_task *task)
 {
-	if(task->status != THREAD_TASK_IDLE && !thread_task_is_finished(task)) return TPOOL_ERR_TASK_IN_POOL;
-	if(task->status != THREAD_TASK_IDLE){
+	if(task->status.load(std::memory_order_acquire) != THREAD_TASK_IDLE && !thread_task_is_finished(task)) return TPOOL_ERR_TASK_IN_POOL;
+	if(task->status.load(std::memory_order_acquire) != THREAD_TASK_IDLE){
 		if(auto status = thread_task_join(task); status != 0) return status;
 	}
 	
@@ -236,10 +236,10 @@ thread_task_detach(struct thread_task *task)
 {
 	if(!task) return 0;
 	std::unique_lock l(task->mtx);
-	if(task->status == THREAD_TASK_IDLE){
+	if(task->status.load(std::memory_order_acquire) == THREAD_TASK_IDLE){
 		return TPOOL_ERR_TASK_NOT_PUSHED;
 	}
-	if(task->status == THREAD_TASK_FINISHED){
+	if(task->status.load(std::memory_order_acquire) == THREAD_TASK_FINISHED){
 		l.unlock();
 		delete task;
 		return 0;
