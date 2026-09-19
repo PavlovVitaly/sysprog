@@ -40,7 +40,8 @@ struct chat_server {
 };
 
 static void
-close_server(chat_server *server){
+close_server(chat_server *server)
+{
 	if(!server) return;
 	for(auto& item : server->peers){
 		if(item->socket == -1) continue;
@@ -53,7 +54,8 @@ close_server(chat_server *server){
 }
 
 static void
-close_peer(chat_server *server, chat_peer *peer){
+close_peer(chat_server *server, chat_peer *peer)
+{
 	if(!peer) return;
 	epoll_ctl(server->epoll_desk, EPOLL_CTL_DEL, peer->socket, NULL);
 	server->peers.erase(peer);
@@ -64,7 +66,6 @@ struct chat_server *
 chat_server_new(void)
 {
 	struct chat_server *server = new chat_server();
-	
 	return server;
 }
 
@@ -75,20 +76,19 @@ chat_server_delete(struct chat_server *server)
 	delete server;
 }
 
+/*
+ * 1) Create a server socket (function socket()).
+ * 2) Bind the server socket to addr (function bind()).
+ * 3) Listen the server socket (function listen()).
+ * 4) Create epoll/kqueue if needed.
+ */
 int
 chat_server_listen(struct chat_server *server, uint16_t port)
 {
-	/*
-	 * 1) Create a server socket (function socket()).
-	 * 2) Bind the server socket to addr (function bind()).
-	 * 3) Listen the server socket (function listen()).
-	 * 4) Create epoll/kqueue if needed.
-	 */
 	struct sockaddr_in addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(port);
-	/* Listen on all IPs of this machine. */
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
 	server->socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -99,6 +99,7 @@ chat_server_listen(struct chat_server *server, uint16_t port)
 	if (bind(server->socket, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
 		return -1;
 	}
+
 	if (listen(server->socket, 128) == -1) {
 		printf("listen error = %s\n", strerror(errno));
 		return -1;
@@ -141,8 +142,21 @@ chat_server_pop_next(struct chat_server *server)
 	return res;
 }
 
+static void
+sendDataToClient(chat_server *server, chat_peer *client, const std::string& raw_msg)
+{
+	client->out_buffer += raw_msg;
+	client->out_buffer.push_back('\n');
+
+	struct epoll_event ev;
+	memset(&ev, 0, sizeof(ev));
+	ev.events = EPOLLIN | EPOLLOUT;
+	ev.data.ptr = client;
+	epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, client->socket, &ev);
+}
+
 static int
-interact(chat_server *server, chat_peer *p)
+communicate(chat_server *server, chat_peer *p)
 {
 	size_t buf_size = 1024;
 	char buf[buf_size];
@@ -164,116 +178,74 @@ interact(chat_server *server, chat_peer *p)
 
 		for (chat_peer *other : server->peers) {
 			if (other == p) continue; 
-
-			other->out_buffer += raw_msg;
-			other->out_buffer.push_back('\n'); // Обязательный сетевой разделитель
-
-			struct epoll_event ev;
-			memset(&ev, 0, sizeof(ev));
-			ev.events = EPOLLIN | EPOLLOUT;
-			ev.data.ptr = other;
-			epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, other->socket, &ev);
+			sendDataToClient(server, other, raw_msg);
 		}
 		p->partial_input.erase(0, pos + 1);
 	}
-
 	return 0;
 }
 
-int
-chat_server_update(struct chat_server *server, double timeout)
+static int
+createNewClient(int peer_sock, chat_server *server)
 {
-	/*
-	 * 1) Wait on epoll/kqueue/poll for update on any socket.
-	 * 2) Handle the update.
-	 * 2.1) If the update was on listen-socket, then you probably need to
-	 *     call accept() on it - a new client wants to join.
-	 * 2.2) If the update was on a client-socket, then you might want to
-	 *     read/write on it.
-	 */
-	if(!server || server->socket == -1) return CHAT_ERR_NOT_STARTED;
+	int flags = fcntl(peer_sock, F_GETFL, 0);
+	fcntl(peer_sock, F_SETFL, flags | O_NONBLOCK);
 
-	int ms = timeout * 1000;
-	struct epoll_event events[MAX_EVENTS];
-	int nfds = epoll_wait(server->epoll_desk, events, MAX_EVENTS, ms);
-	if (nfds == -1) {
-		return CHAT_ERR_SYS;
+	chat_peer *p = new chat_peer;
+	epoll_event ev;
+	ev.data.ptr = p;
+	ev.events = EPOLLIN;
+	if (epoll_ctl(server->epoll_desk, EPOLL_CTL_ADD, peer_sock, &ev) == -1) {
+		printf("error = %s\n", strerror(errno));
+		close(peer_sock);
+		delete p;
+		return -1;
 	}
-	bool has_data{};
+	p->socket = peer_sock;
+	server->peers.insert(p);
+	return 0;
+}
 
-	for(int i = 0; i < nfds; ++i){
-		if (events[i].data.ptr == NULL) {
-			while (true) {
-				int peer_sock = accept(server->socket, NULL, NULL);
-				if (peer_sock == -1) {
-					if (errno == EAGAIN || errno == EWOULDBLOCK) {
-						break; 
-					}
-					printf("error = %s\n", strerror(errno));
-					break;
-				}
-				
-				int flags = fcntl(peer_sock, F_GETFL, 0);
-				fcntl(peer_sock, F_SETFL, flags | O_NONBLOCK);
-
-				chat_peer *p = new chat_peer;
-				epoll_event ev;
-				ev.data.ptr = p;
-				ev.events = EPOLLIN;
-				if (epoll_ctl(server->epoll_desk, EPOLL_CTL_ADD, peer_sock, &ev) == -1) {
-					printf("error = %s\n", strerror(errno));
-					close(peer_sock);
-					delete p;
-					break;
-				}
-				p->socket = peer_sock;
-				server->peers.insert(p);
-				has_data = true;
+static void
+handleNewClientConnection(chat_server *server, bool *has_data)
+{
+	while (true) {
+		int peer_sock = accept(server->socket, NULL, NULL);
+		if (peer_sock == -1) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				break; 
 			}
-			continue;
+			printf("error = %s\n", strerror(errno));
+			break;
 		}
-
-		chat_peer *p = static_cast<chat_peer *>(events[i].data.ptr);
-		bool drop_client{};
-
-		if(events[i].events & EPOLLIN){
-			int rc = interact(server, p);
-			if (rc == -1) {
-				if (errno != EWOULDBLOCK && errno != EAGAIN) {
-					printf("error = %s\n", strerror(errno));
-					drop_client = true;
-				}
-			} else {
-				has_data = true;
-			}
-		}
-
-		if(!drop_client && !p->out_buffer.empty()){
-			ssize_t sent = send(p->socket, p->out_buffer.c_str(), p->out_buffer.size(), 0);
-			if (sent > 0) {
-				has_data = true;
-				p->out_buffer.erase(0, sent);
-			} else if (sent == -1) {
-				if (errno != EAGAIN && errno != EWOULDBLOCK) {
-					drop_client = true;
-				}
-			}
-
-			if(p->out_buffer.empty() && !drop_client){
-				struct epoll_event ev;
-				memset(&ev, 0, sizeof(ev));
-				ev.events = EPOLLIN;
-				ev.data.ptr = p;
-				epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, p->socket, &ev);
-			}
-		}
-
-		if(drop_client) {
-			close_peer(server, p);
-			has_data = true;
-		}
+		
+		auto status = createNewClient(peer_sock, server);
+		if(status < 0) break;
+		*has_data = true;
 	}
+}
 
+static void
+sendClientsDataToClients(chat_server *server, chat_peer *p, bool *has_data, bool *drop_client)
+{
+	ssize_t sent = send(p->socket, p->out_buffer.c_str(), p->out_buffer.size(), 0);
+	if (sent > 0) {
+		*has_data = true;
+		p->out_buffer.erase(0, sent);
+	} else if (sent == -1 && errno != EAGAIN && errno != EWOULDBLOCK) *drop_client = true;
+
+	if(p->out_buffer.empty() && !*drop_client){
+		struct epoll_event ev;
+		memset(&ev, 0, sizeof(ev));
+		ev.events = EPOLLIN;
+		ev.data.ptr = p;
+		epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, p->socket, &ev);
+	}
+}
+
+static void
+sendServerDataToClients(chat_server *server)
+{
 	while (!server->input_buffer.empty() && !server->peers.empty()) {
 		std::string fed_msg = std::move(server->input_buffer.front());
 		server->input_buffer.pop();
@@ -287,6 +259,61 @@ chat_server_update(struct chat_server *server, double timeout)
 			epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, item->socket, &ev);
 		}
 	}
+}
+
+/*
+ * 1) Wait on epoll/kqueue/poll for update on any socket.
+ * 2) Handle the update.
+ * 2.1) If the update was on listen-socket, then you probably need to
+ *     call accept() on it - a new client wants to join.
+ * 2.2) If the update was on a client-socket, then you might want to
+ *     read/write on it.
+ */
+int
+chat_server_update(struct chat_server *server, double timeout)
+{
+	if(!server || server->socket == -1) return CHAT_ERR_NOT_STARTED;
+
+	int ms = timeout * 1000;
+	struct epoll_event events[MAX_EVENTS];
+	int nfds = epoll_wait(server->epoll_desk, events, MAX_EVENTS, ms);
+	if (nfds == -1) {
+		return CHAT_ERR_SYS;
+	}
+	bool has_data{};
+
+	for(int i = 0; i < nfds; ++i){
+		if (events[i].data.ptr == NULL) {
+			handleNewClientConnection(server, &has_data);
+			continue;
+		}
+
+		chat_peer *p = static_cast<chat_peer *>(events[i].data.ptr);
+		bool drop_client{};
+
+		if(events[i].events & EPOLLIN){
+			int rc = communicate(server, p);
+			if (rc == -1) {
+				if (errno != EWOULDBLOCK && errno != EAGAIN) {
+					printf("error = %s\n", strerror(errno));
+					drop_client = true;
+				}
+			} else {
+				has_data = true;
+			}
+		}
+
+		if(!drop_client && !p->out_buffer.empty()){
+			sendClientsDataToClients(server, p, &has_data, &drop_client);
+		}
+
+		if(drop_client) {
+			close_peer(server, p);
+			has_data = true;
+		}
+	}
+
+	sendServerDataToClients(server);
 
 	if (nfds == 0 && !has_data) {
 		return CHAT_ERR_TIMEOUT;
@@ -295,27 +322,25 @@ chat_server_update(struct chat_server *server, double timeout)
 	return 0;
 }
 
+/*
+ * Server has multiple sockets - own and from connected clients. Hence
+ * you can't return a socket here. But if you are using epoll/kqueue,
+ * then you can return their descriptor. These descriptors can be polled
+ * just like sockets and will return an event when any of their owned
+ * descriptors has any events.
+ *
+ * For example, assume you created an epoll descriptor and added to
+ * there a listen-socket and a few client-sockets. Now if you will call
+ * poll() on the epoll's descriptor, then on return from poll() you can
+ * be sure epoll_wait() can return something useful for some of those
+ * sockets.
+ */
 int
 chat_server_get_descriptor(const struct chat_server *server)
 {
 	if(!server) return -1;
-#if NEED_SERVER_FEED
-	/* IMPLEMENT THIS FUNCTION if want +5 points. */
-
-	/*
-	 * Server has multiple sockets - own and from connected clients. Hence
-	 * you can't return a socket here. But if you are using epoll/kqueue,
-	 * then you can return their descriptor. These descriptors can be polled
-	 * just like sockets and will return an event when any of their owned
-	 * descriptors has any events.
-	 *
-	 * For example, assume you created an epoll descriptor and added to
-	 * there a listen-socket and a few client-sockets. Now if you will call
-	 * poll() on the epoll's descriptor, then on return from poll() you can
-	 * be sure epoll_wait() can return something useful for some of those
-	 * sockets.
-	 */
-#endif
+//#if NEED_SERVER_FEED
+//#endif
 	return server->epoll_desk;
 }
 

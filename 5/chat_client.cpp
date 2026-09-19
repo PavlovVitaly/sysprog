@@ -26,7 +26,7 @@ struct chat_client {
 	/* PUT HERE OTHER MEMBERS */
 	std::string name{};
 	std::string partial_input{}; 
-	bool is_start_of_line = true; 
+	bool is_start_of_line{true}; 
 };
 
 struct chat_client *
@@ -53,7 +53,8 @@ chat_client_delete(struct chat_client *client)
 	delete client;
 }
 
-void parse_addr(std::string_view addr, std::string& ip, std::string& port){
+void parse_addr(std::string_view addr, std::string& ip, std::string& port)
+{
 	auto pos = addr.find(':');
 	if(pos != std::string_view::npos){
 		ip = addr.substr(0, pos);
@@ -101,7 +102,7 @@ chat_client_connect(struct chat_client *client, std::string_view addr)
 	if (rc == -1) {
 		close(client->socket);
 		client->socket = -1;
-		return -1; // или CHAT_ERR_SYS
+		return CHAT_ERR_SYS;
 	}
 
 	int flags = fcntl(client->socket, F_GETFL, 0);
@@ -127,18 +128,76 @@ chat_client_pop_next(struct chat_client *client)
 	return res;
 }
 
+static int
+sendMsgToServer(chat_client *client, bool *has_data)
+{
+		while(!client->output_buffer.empty()){
+			auto& data = client->output_buffer.front();
+			if (data->data.empty()) {
+				client->output_buffer.pop();
+				continue;
+			}
+
+			int sent = send(client->socket, data->data.c_str(), data->data.size(), 0);			
+			if (sent > 0) {
+				*has_data = true;	
+				if (static_cast<size_t>(sent) == data->data.size()) {
+					client->output_buffer.pop();
+				} else {
+					data->data.erase(0, sent); 
+					break; 
+				}
+			} else {
+				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					break; 
+				}
+				return -1;
+			}
+		}
+		return 0;
+}
+
+static int
+recieveMsgToServer(chat_client *client, bool *has_data)
+{
+	size_t buf_size = 4096;
+	char buf[buf_size];
+	ssize_t sz = recv(client->socket, buf, buf_size, 0);
+	while(sz > 0){
+		*has_data = true;
+		client->partial_input.append(buf, sz);
+		sz = recv(client->socket, buf, buf_size, 0);
+	}
+	size_t pos;
+	while ((pos = client->partial_input.find('\n')) != std::string::npos) {
+		auto msg = std::make_unique<chat_message>();
+		msg->data = client->partial_input.substr(0, pos);
+		client->input_buffer.push(std::move(msg));
+		client->partial_input.erase(0, pos + 1);
+	}
+
+	if(sz < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+		return -1;
+	}
+	if(sz == 0){
+		close(client->socket);
+		client->socket = -1;
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * The easiest way to wait for updates on a single socket with a timeout
+ * is to use poll(). Epoll is good for many sockets, poll is good for a
+ * few.
+ *
+ * You create one struct pollfd, fill it, call poll() on it, handle the
+ * events (do read/write).
+ */
 int
 chat_client_update(struct chat_client *client, double timeout)
 {
-	/*
-	 * The easiest way to wait for updates on a single socket with a timeout
-	 * is to use poll(). Epoll is good for many sockets, poll is good for a
-	 * few.
-	 *
-	 * You create one struct pollfd, fill it, call poll() on it, handle the
-	 * events (do read/write).
-	 */
-
 	if(!client || client->socket == -1) return CHAT_ERR_NOT_STARTED;
 	pollfd fd;
 	fd.fd = client->socket;
@@ -154,56 +213,13 @@ chat_client_update(struct chat_client *client, double timeout)
 	bool has_data{};
 
 	if(fd.revents & POLLOUT){
-		while(!client->output_buffer.empty()){
-			auto& data = client->output_buffer.front();
-			if (data->data.empty()) {
-				client->output_buffer.pop();
-				continue;
-			}
-
-			int sent = send(client->socket, data->data.c_str(), data->data.size(), 0);			
-			if (sent > 0) {
-				has_data = true;	
-				if (static_cast<size_t>(sent) == data->data.size()) {
-					client->output_buffer.pop();
-				} else {
-					data->data.erase(0, sent); 
-					break; 
-				}
-			} else {
-				if (errno == EAGAIN || errno == EWOULDBLOCK) {
-					break; 
-				}
-				return -1;
-			}
-		}
+		auto res = sendMsgToServer(client, &has_data);
+		if(res < 0) return -1;
 	}
 
 	if(fd.revents & POLLIN){
-		size_t buf_size = 4096;
-		char buf[buf_size];
-		ssize_t sz = recv(client->socket, buf, buf_size, 0);
-		while(sz > 0){
-			has_data = true;
-			client->partial_input.append(buf, sz);
-			sz = recv(client->socket, buf, buf_size, 0);
-		}
-		size_t pos;
-		while ((pos = client->partial_input.find('\n')) != std::string::npos) {
-			auto msg = std::make_unique<chat_message>();
-			msg->data = client->partial_input.substr(0, pos);
-			client->input_buffer.push(std::move(msg));
-			client->partial_input.erase(0, pos + 1);
-		}
-
-		if(sz < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-			return -1;
-		}
-		if(sz == 0){
-			close(client->socket);
-			client->socket = -1;
-			return -1;
-		}
+		auto res = recieveMsgToServer(client, &has_data);
+		if(res < 0) return -1;
 	}
 
 	if (status == 0 && !has_data && client->output_buffer.empty()) {
