@@ -8,7 +8,7 @@ set(COMMON_FLAGS
     -Werror
     -Wall
     -Wno-gnu-folding-constant
-    -g
+#    -g
 #    -fsanitize=thread
 )
 add_compile_options(${COMMON_FLAGS})
