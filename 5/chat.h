@@ -34,10 +34,19 @@ enum chat_events {
 	CHAT_EVENT_OUTPUT = 2,
 };
 
+enum chat_msg_type {
+	MESSAGE = 1,
+	CLIENT_NAME = 2,
+	CLIENT_ID = 3,
+	NEW_CLIENT = 4,
+	DROP_CLIENT = 5,
+};
+
 struct chat_message {
 #if NEED_AUTHOR
 	/** Author's name. */
 	std::string author;
+	chat_msg_type msg_type;
 #endif
 	/** 0-terminate text. */
 	std::string data;

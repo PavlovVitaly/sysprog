@@ -14,6 +14,7 @@
 #include <memory>
 #include <queue>
 #include <fcntl.h>
+#include <unordered_map>
 
 struct chat_client {
 	/** Socket connected to the server. */
@@ -25,8 +26,12 @@ struct chat_client {
 	/* ... */
 	/* PUT HERE OTHER MEMBERS */
 	std::string name{};
+	int id{-1};
 	std::string partial_input{}; 
-	bool is_start_of_line{true}; 
+	bool is_start_of_line{true};
+#if NEED_AUTHOR
+	std::unordered_map<int, std::string> other_clients;
+#endif
 };
 
 struct chat_client *
@@ -65,14 +70,107 @@ void parse_addr(std::string_view addr, std::string& ip, std::string& port)
 	port = "80";
 }
 
+static int
+sendClientName(chat_client *client)
+{
+	std::string data;
+	data.push_back(chat_msg_type::CLIENT_NAME);
+	data.append(client->name);
+	int sent = send(client->socket, data.c_str(), data.size(), 0);			
+	if (sent < 0) return -1;
+	return 0;
+}
+
+static int parseData(chat_client *client){
+	size_t pos;
+	while((pos = client->partial_input.find('\n')) != std::string::npos) {
+#if NEED_AUTHOR
+		chat_msg_type msg_code = static_cast<chat_msg_type>(client->partial_input[0]);
+		switch (msg_code) {
+			case chat_msg_type::MESSAGE:{
+				auto msg = std::make_unique<chat_message>();
+				try {
+				    int id = std::stoi(client->partial_input.substr(1, 4));
+					msg->author = client->other_clients.at(id);
+				} catch (...) {
+					return -1;
+				}
+				msg->data = client->partial_input.substr(5, pos - 5);
+				client->input_buffer.push(std::move(msg));
+				break;
+			}
+			case chat_msg_type::CLIENT_NAME:
+				return -1;
+			case chat_msg_type::CLIENT_ID:{
+				try {
+				    client->id = std::stoi(client->partial_input.substr(1, 4));
+				} catch (...) {
+					return -1;
+				}
+				break;
+			}
+			case chat_msg_type::NEW_CLIENT:{
+				int id{-1};
+				try {
+				    id = std::stoi(client->partial_input.substr(1, 4));
+				} catch (...) {
+					return -1;
+				}
+				std::string name = client->partial_input.substr(5, pos - 5);
+				client->other_clients[id] = std::move(name);
+				break;
+			}
+			case chat_msg_type::DROP_CLIENT:{
+				int id{-1};
+				try {
+				    id = std::stoi(client->partial_input.substr(1, 4));
+				} catch (...) {
+					return -1;
+				}
+				client->other_clients.erase(id);
+				break;
+			}
+		}
+#else
+		auto msg = std::make_unique<chat_message>();
+		msg->data = client->partial_input.substr(0, pos);
+		client->input_buffer.push(std::move(msg));
+#endif
+		client->partial_input.erase(0, pos + 1);
+	}
+	return 0;
+}
+
+static int
+recieveClientId(chat_client *client)
+{
+	size_t buf_size = 4096;
+	char buf[buf_size];
+	
+	ssize_t sz = recv(client->socket, buf, buf_size, 0);
+	
+	if (sz > 0) {
+		client->partial_input.append(buf, sz);
+	} else if (sz == 0) {
+		close(client->socket);
+		client->socket = -1;
+		return -1;
+	} else return -1; 
+	
+	auto stat = parseData(client);
+	if(stat < 0) return -1;
+
+	return 0;
+}
+
+/*
+ * 1) Use getaddrinfo() to resolve addr to struct sockaddr_in.
+ * 2) Create a client socket (function socket()).
+ * 3) Connect it by the found address (function connect()).
+ */
 int
 chat_client_connect(struct chat_client *client, std::string_view addr)
 {
-	/*
-	 * 1) Use getaddrinfo() to resolve addr to struct sockaddr_in.
-	 * 2) Create a client socket (function socket()).
-	 * 3) Connect it by the found address (function connect()).
-	 */
 	std::string ip{};
 	std::string port{};
 	parse_addr(addr,ip, port);
@@ -105,9 +203,14 @@ chat_client_connect(struct chat_client *client, std::string_view addr)
 		return CHAT_ERR_SYS;
 	}
 
+#if NEED_AUTHOR
+	auto statName = sendClientName(client);
+	if(statName < 0) return -1;
+	auto statId = recieveClientId(client);
+	if(statId < 0) return -1;
+#endif
 	int flags = fcntl(client->socket, F_GETFL, 0);
 	fcntl(client->socket, F_SETFL, flags | O_NONBLOCK);
-
 	return 0;
 }
 
@@ -117,44 +220,36 @@ chat_client_pop_next(struct chat_client *client)
 	if(!client || client->input_buffer.empty()) return nullptr;
 	auto res = client->input_buffer.front().release();
 	client->input_buffer.pop();
-#if NEED_AUTHOR
-	auto tmp = res->data;
-	size_t pos{};
-	if ((pos = tmp.find(":%:")) != std::string::npos){
-		res->author = tmp.substr(0, pos);
-		res->data = tmp.substr(pos + 3);
-	}
-#endif
 	return res;
 }
 
 static int
 sendMsgToServer(chat_client *client, bool *has_data)
 {
-		while(!client->output_buffer.empty()){
-			auto& data = client->output_buffer.front();
-			if (data->data.empty()) {
-				client->output_buffer.pop();
-				continue;
-			}
-
-			int sent = send(client->socket, data->data.c_str(), data->data.size(), 0);			
-			if (sent > 0) {
-				*has_data = true;	
-				if (static_cast<size_t>(sent) == data->data.size()) {
-					client->output_buffer.pop();
-				} else {
-					data->data.erase(0, sent); 
-					break; 
-				}
-			} else {
-				if (errno == EAGAIN || errno == EWOULDBLOCK) {
-					break; 
-				}
-				return -1;
-			}
+	while(!client->output_buffer.empty()){
+		auto& data = client->output_buffer.front();
+		if (data->data.empty()) {
+			client->output_buffer.pop();
+			continue;
 		}
-		return 0;
+
+		int sent = send(client->socket, data->data.c_str(), data->data.size(), 0);			
+		if (sent > 0) {
+			*has_data = true;	
+			if (static_cast<size_t>(sent) == data->data.size()) {
+				client->output_buffer.pop();
+			} else {
+				data->data.erase(0, sent); 
+				break; 
+			}
+		} else {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				break; 
+			}
+			return -1;
+		}
+	}
+	return 0;
 }
 
 static int
@@ -168,17 +263,11 @@ recieveMsgToServer(chat_client *client, bool *has_data)
 		client->partial_input.append(buf, sz);
 		sz = recv(client->socket, buf, buf_size, 0);
 	}
-	size_t pos;
-	while ((pos = client->partial_input.find('\n')) != std::string::npos) {
-		auto msg = std::make_unique<chat_message>();
-		msg->data = client->partial_input.substr(0, pos);
-		client->input_buffer.push(std::move(msg));
-		client->partial_input.erase(0, pos + 1);
-	}
+	
+	auto stat = parseData(client);
+	if(stat < 0) return -1;
 
-	if(sz < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-		return -1;
-	}
+	if(sz < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
 	if(sz == 0){
 		close(client->socket);
 		client->socket = -1;
@@ -261,7 +350,9 @@ chat_client_feed(struct chat_client *client, const char *msg, uint32_t msg_size)
 
 	while ((pos = buf.find('\n', start_pos)) != std::string::npos) {
 		if (client->is_start_of_line) {
-			data->data += client->name + ":%:";
+			char id_buf[5];
+			snprintf(id_buf, sizeof(id_buf), "%04d", client->id);
+			data->data += static_cast<char>(chat_msg_type::MESSAGE) + std::string(id_buf);
 		}
 		
 		data->data += buf.substr(start_pos, pos - start_pos) + "\n";
@@ -270,7 +361,9 @@ chat_client_feed(struct chat_client *client, const char *msg, uint32_t msg_size)
 	}
 	if (start_pos < buf.size()) {
 		if (client->is_start_of_line) {
-			data->data += client->name + ":%:";
+			char id_buf[5];
+			snprintf(id_buf, sizeof(id_buf), "%04d", client->id);
+			data->data += static_cast<char>(chat_msg_type::MESSAGE) + std::string(id_buf);
 		}
 		data->data += buf.substr(start_pos);
 		client->is_start_of_line = false;
