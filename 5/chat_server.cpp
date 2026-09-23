@@ -1,74 +1,261 @@
 #include "chat.h"
 #include "chat_server.h"
 
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cctype>
+#include <cstdint>
+#include <cstring>
+#include <fcntl.h>
+#include <limits.h>
+#include <memory>
 #include <netinet/in.h>
-#include <stdlib.h>
-#include <string.h>
+#include <queue>
 #include <string>
+#include <string_view>
+#include <sys/epoll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <unordered_set>
-#include <arpa/inet.h> 
-#include <pthread.h>
-#include <sys/epoll.h>
-#include <memory>
-#include <queue>
-#include <fcntl.h>
+#include <utility>
+#include <vector>
 
-#define CLIENT_BUFFER_SIZE 1024
-#define MAX_EVENTS 100
+namespace {
 
-struct chat_peer {
-	/** Client's socket. To read/write messages. */
-	int socket;
-	/** Output buffer. */
-	std::string out_buffer;
-	/* PUT HERE OTHER MEMBERS */
-	std::string partial_input{};
-	std::string name;
+enum {
+	FRAME_HEADER_SIZE = 9,
+	IO_BUFFER_SIZE = 64 * 1024,
+	EPOLL_EVENT_LIMIT = 100,
 };
 
-struct chat_server {
-	/** Listening socket. To accept new clients. */
-	int socket = -1;
-	/** Array of peers. */
-	std::unordered_set<chat_peer *> peers{};
-	/* ... */
-	/* PUT HERE OTHER MEMBERS */
-	int epoll_desk{-1};
-	std::queue<std::unique_ptr<chat_message>> output_buffer;
-	std::queue<std::string> input_buffer;
-	bool is_start_of_line = true; 
+struct frame {
+	chat_msg_type type{};
+	uint32_t id{};
+	std::string payload;
 };
 
 static void
-close_server(chat_server *server)
+write_u32(char *destination, uint32_t value)
 {
-	if(!server) return;
-	for(auto& item : server->peers){
-		if(item->socket == -1) continue;
-		epoll_ctl(server->epoll_desk, EPOLL_CTL_DEL, item->socket, NULL);
-		close(item->socket);
-		delete item;
+	uint32_t network_value = htonl(value);
+	memcpy(destination, &network_value, sizeof(network_value));
+}
+
+static uint32_t
+read_u32(const char *source)
+{
+	uint32_t network_value{};
+	memcpy(&network_value, source, sizeof(network_value));
+	return ntohl(network_value);
+}
+
+static bool
+append_frame(std::string *buffer, chat_msg_type type, uint32_t id,
+	std::string_view payload)
+{
+	if (payload.size() > UINT32_MAX)
+		return false;
+
+	size_t old_size = buffer->size();
+	buffer->resize(old_size + FRAME_HEADER_SIZE + payload.size());
+	char *header = buffer->data() + old_size;
+	header[0] = static_cast<char>(type);
+	write_u32(header + 1, id);
+	write_u32(header + 5, static_cast<uint32_t>(payload.size()));
+	memcpy(header + FRAME_HEADER_SIZE, payload.data(), payload.size());
+	return true;
+}
+
+static bool
+take_frame(std::string *buffer, frame *result)
+{
+	if (buffer->size() < FRAME_HEADER_SIZE)
+		return false;
+
+	uint32_t payload_size = read_u32(buffer->data() + 5);
+	if (payload_size > buffer->size() - FRAME_HEADER_SIZE)
+		return false;
+
+	result->type = static_cast<chat_msg_type>(
+		static_cast<unsigned char>((*buffer)[0]));
+	result->id = read_u32(buffer->data() + 1);
+	result->payload.assign(buffer->data() + FRAME_HEADER_SIZE, payload_size);
+	buffer->erase(0, FRAME_HEADER_SIZE + payload_size);
+	return true;
+}
+
+static std::string_view
+trim_message(std::string_view message)
+{
+	size_t first = 0;
+	while (first < message.size() &&
+		std::isspace(static_cast<unsigned char>(message[first])))
+		++first;
+
+	size_t last = message.size();
+	while (last > first &&
+		std::isspace(static_cast<unsigned char>(message[last - 1])))
+		--last;
+
+	return message.substr(first, last - first);
+}
+
+static int
+set_nonblocking(int socket)
+{
+	int flags = fcntl(socket, F_GETFL, 0);
+	if (flags == -1)
+		return -1;
+	return fcntl(socket, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int
+timeout_to_milliseconds(double timeout)
+{
+	if (timeout < 0.0)
+		return -1;
+	if (timeout >= static_cast<double>(INT32_MAX) / 1000.0)
+		return INT32_MAX;
+	return static_cast<int>(timeout * 1000.0);
+}
+
+} // namespace
+
+struct chat_peer {
+	int socket = -1;
+	uint32_t id = 0;
+	std::string name;
+	std::string input_buffer;
+	std::string output_buffer;
+	std::vector<std::pair<uint32_t, std::string>> pending_messages;
+	bool name_received = false;
+};
+
+struct chat_server {
+	int socket = -1;
+	std::unordered_set<chat_peer *> peers;
+	int epoll_descriptor = -1;
+	std::queue<std::unique_ptr<chat_message>> output_buffer;
+	std::queue<std::string> server_messages;
+	std::string partial_server_feed;
+	uint32_t next_client_id = 1;
+};
+
+static void
+close_server_resources(chat_server *server)
+{
+	if (!server)
+		return;
+	for (chat_peer *peer : server->peers) {
+		if (server->epoll_descriptor != -1)
+			epoll_ctl(server->epoll_descriptor, EPOLL_CTL_DEL,
+				peer->socket, nullptr);
+		if (peer->socket != -1)
+			close(peer->socket);
+		delete peer;
 	}
-	if(server->socket != -1) close(server->socket);
-	if(server->epoll_desk != -1) close(server->epoll_desk);
+	server->peers.clear();
+	if (server->socket != -1) {
+		close(server->socket);
+		server->socket = -1;
+	}
+	if (server->epoll_descriptor != -1) {
+		close(server->epoll_descriptor);
+		server->epoll_descriptor = -1;
+	}
+}
+
+struct chat_server *
+chat_server_new(void)
+{
+	return new chat_server();
+}
+
+void
+chat_server_delete(struct chat_server *server)
+{
+	if (!server)
+		return;
+	close_server_resources(server);
+	delete server;
+}
+
+int
+chat_server_listen(struct chat_server *server, uint16_t port)
+{
+	if (!server)
+		return CHAT_ERR_INVALID_ARGUMENT;
+	if (server->socket != -1)
+		return CHAT_ERR_ALREADY_STARTED;
+
+	server->socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (server->socket == -1)
+		return CHAT_ERR_SYS;
+
+	int reuse = 1;
+	(void)setsockopt(server->socket, SOL_SOCKET, SO_REUSEADDR,
+		&reuse, sizeof(reuse));
+	if (set_nonblocking(server->socket) == -1) {
+		close_server_resources(server);
+		return CHAT_ERR_SYS;
+	}
+
+	struct sockaddr_in address{};
+	address.sin_family = AF_INET;
+	address.sin_port = htons(port);
+	address.sin_addr.s_addr = htonl(INADDR_ANY);
+	if (bind(server->socket, reinterpret_cast<struct sockaddr *>(&address),
+		sizeof(address)) != 0) {
+		int error = errno;
+		close_server_resources(server);
+		return error == EADDRINUSE ? CHAT_ERR_PORT_BUSY : CHAT_ERR_SYS;
+	}
+	if (listen(server->socket, 128) == -1) {
+		close_server_resources(server);
+		return CHAT_ERR_SYS;
+	}
+
+	server->epoll_descriptor = epoll_create1(0);
+	if (server->epoll_descriptor == -1) {
+		close_server_resources(server);
+		return CHAT_ERR_SYS;
+	}
+
+	struct epoll_event event{};
+	event.events = EPOLLIN | EPOLLET;
+	event.data.ptr = nullptr;
+	if (epoll_ctl(server->epoll_descriptor, EPOLL_CTL_ADD,
+		server->socket, &event) == -1) {
+		close_server_resources(server);
+		return CHAT_ERR_SYS;
+	}
+	return 0;
+}
+
+struct chat_message *
+chat_server_pop_next(struct chat_server *server)
+{
+	if (!server || server->output_buffer.empty())
+		return nullptr;
+	chat_message *result = server->output_buffer.front().release();
+	server->output_buffer.pop();
+	return result;
+}
+
+static bool
+queue_frame(chat_peer *peer, chat_msg_type type, uint32_t id,
+	std::string_view payload)
+{
+	return append_frame(&peer->output_buffer, type, id, payload);
 }
 
 #if NEED_AUTHOR
 static void
-sendDropClientMsg(chat_server *server, int id){
-	char id_buf[8];
-	snprintf(id_buf, sizeof(id_buf), "%04d", id);
-	std::string data(1, static_cast<char>(chat_msg_type::DROP_CLIENT));
-	data += std::string(id_buf) + '\n';
-
-	for (chat_peer *item : server->peers) {
-		item->out_buffer += data;
-		struct epoll_event ev;
-		memset(&ev, 0, sizeof(ev));
-		ev.events = EPOLLIN | EPOLLOUT;
-		ev.data.ptr = item;
-		epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, item->socket, &ev);
+queue_drop_notification(chat_server *server, uint32_t dropped_id)
+{
+	for (chat_peer *peer : server->peers) {
+		if (peer->name_received)
+			queue_frame(peer, DROP_CLIENT, dropped_id, {});
 	}
 }
 #endif
@@ -76,427 +263,314 @@ sendDropClientMsg(chat_server *server, int id){
 static void
 close_peer(chat_server *server, chat_peer *peer)
 {
-	if(!peer) return;
-	epoll_ctl(server->epoll_desk, EPOLL_CTL_DEL, peer->socket, NULL);
+	if (!peer)
+		return;
 	server->peers.erase(peer);
+	if (server->epoll_descriptor != -1)
+		epoll_ctl(server->epoll_descriptor, EPOLL_CTL_DEL,
+			peer->socket, nullptr);
 #if NEED_AUTHOR
-	sendDropClientMsg(server, peer->socket);
+	if (peer->name_received)
+		queue_drop_notification(server, peer->id);
 #endif
+	if (peer->socket != -1)
+		close(peer->socket);
 	delete peer;
 }
 
-struct chat_server *
-chat_server_new(void)
-{
-	struct chat_server *server = new chat_server();
-	return server;
-}
-
-void
-chat_server_delete(struct chat_server *server)
-{
-	close_server(server);
-	delete server;
-}
-
-/*
- * 1) Create a server socket (function socket()).
- * 2) Bind the server socket to addr (function bind()).
- * 3) Listen the server socket (function listen()).
- * 4) Create epoll/kqueue if needed.
- */
-int
-chat_server_listen(struct chat_server *server, uint16_t port)
-{
-	struct sockaddr_in addr;
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(port);
-	addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-	server->socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (server->socket == -1) {
-		return -1;
-	}
-
-	if (bind(server->socket, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
-		return -1;
-	}
-
-	if (listen(server->socket, 128) == -1) {
-		printf("listen error = %s\n", strerror(errno));
-		return -1;
-	}
-
-	int flags = fcntl(server->socket, F_GETFL, 0);
-	fcntl(server->socket, F_SETFL, flags | O_NONBLOCK);
-
-	server->epoll_desk = epoll_create1(0);
-	if (server->epoll_desk == -1) {
-		close_server(server);
-		return -1;
-	}
-
-	struct epoll_event new_ev;
-	new_ev.data.ptr = NULL;
-	new_ev.events = EPOLLIN;
-	if (epoll_ctl(server->epoll_desk, EPOLL_CTL_ADD, server->socket, &new_ev) == -1) {
-		close_server(server);
-		return -1;
-	}
-
-	return 0;
-}
-
-struct chat_message *
-chat_server_pop_next(struct chat_server *server)
-{
-	if(!server || server->output_buffer.empty()) return nullptr;
-	auto* res = server->output_buffer.front().release();
-	server->output_buffer.pop();
-#if NEED_AUTHOR
-	std::string tmp = res->data;
-	if (!tmp.empty() && static_cast<chat_msg_type>(tmp[0]) == chat_msg_type::MESSAGE) {
-		try {
-			int id = std::stoi(tmp.substr(1, 4));
-			for (chat_peer *p : server->peers) {
-				if (p->socket == id) {
-					res->author = p->name;
-					break;
-				}
-			}
-			res->data = tmp.substr(5);
-		} catch (...) {}
-	}
-#endif
-	return res;
-}
-
 static void
-sendDataToClient(chat_server *server, chat_peer *client, const std::string& raw_msg)
+broadcast_message(chat_server *server, chat_peer *sender,
+	std::string_view body)
 {
-	client->out_buffer += raw_msg;
-	client->out_buffer.push_back('\n');
+	body = trim_message(body);
+	if (body.empty())
+		return;
 
-	struct epoll_event ev;
-	memset(&ev, 0, sizeof(ev));
-	ev.events = EPOLLIN | EPOLLOUT;
-	ev.data.ptr = client;
-	epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, client->socket, &ev);
-}
+	auto message = std::make_unique<chat_message>();
+	message->data.assign(body.data(), body.size());
+#if NEED_AUTHOR
+	message->msg_type = MESSAGE;
+	message->author = sender ? sender->name : "server";
+#endif
+	server->output_buffer.push(std::move(message));
 
-static int
-communicate(chat_server *server, chat_peer *p)
-{
-	size_t buf_size = 1024;
-	char buf[buf_size];
-	ssize_t sz = recv(p->socket, buf, buf_size, 0);
-	if(sz < 0) return -1;
-	if(sz == 0){
-		errno = 0;
-		return -1;
-	}
-
-	p->partial_input.append(buf, sz);
-	size_t pos;
-	while ((pos = p->partial_input.find('\n')) != std::string::npos) {
-		std::string raw_msg = p->partial_input.substr(0, pos);
-		
-		auto msg = std::make_unique<chat_message>();
-		msg->data = raw_msg;
-		server->output_buffer.push(std::move(msg));
-
-		for (chat_peer *other : server->peers) {
-			if (other == p) continue; 
-			sendDataToClient(server, other, raw_msg);
+	uint32_t author_id = sender ? sender->id : 0;
+	std::vector<chat_peer *> failed_peers;
+	for (chat_peer *peer : server->peers) {
+		if (peer == sender)
+			continue;
+		if (!peer->name_received) {
+			peer->pending_messages.emplace_back(author_id,
+				std::string(body));
+			continue;
 		}
-		p->partial_input.erase(0, pos + 1);
+		if (!queue_frame(peer, MESSAGE, author_id, body))
+			failed_peers.push_back(peer);
 	}
-	return 0;
-}
-
-#if NEED_AUTHOR
-static int
-sendClientIdMsg(chat_peer *client){
-	char id_buf[8];
-	snprintf(id_buf, sizeof(id_buf), "%04d", client->socket);
-	std::string data(1, static_cast<char>(chat_msg_type::CLIENT_ID));
-	data += std::string(id_buf) + '\n';
-
-	int sent = send(client->socket, data.c_str(), data.size(), 0);			
-	if (sent < 0 && !(errno == EAGAIN || errno == EWOULDBLOCK)) {
-		return -1;
-	}
-	return 0;
-}
-
-static void
-sendNewClientMsg(chat_server *server, chat_peer *client){
-	char id_buf[8];
-	snprintf(id_buf, sizeof(id_buf), "%04d", client->socket);
-
-	std::string data(1, static_cast<char>(chat_msg_type::NEW_CLIENT));
-	data += std::string(id_buf) + client->name + '\n';
-
-	for (chat_peer *item : server->peers) {
-		if (item == client) continue;
-		item->out_buffer += data;
-		struct epoll_event ev;
-		memset(&ev, 0, sizeof(ev));
-		ev.events = EPOLLIN | EPOLLOUT;
-		ev.data.ptr = item;
-		epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, item->socket, &ev);
-	}
+	for (chat_peer *peer : failed_peers)
+		close_peer(server, peer);
 }
 
 static int
-recieveClientName(chat_peer *client){
-	size_t buf_size = 4096;
-	char buf[buf_size];
-	ssize_t sz = recv(client->socket, buf, buf_size, 0); 
-	if (sz <= 1) {
-		return -1;
-	}
-	// todo: что если имя больше размера буфера?
-	client->name = std::string(buf + 1, sz - 1);
-	return 0;
-}
-#endif
-
-static int
-createNewClient(int peer_sock, chat_server *server)
+handle_peer_frame(chat_server *server, chat_peer *peer,
+	const frame& incoming)
 {
-	chat_peer *p = new chat_peer;
-	p->socket = peer_sock;
+#if NEED_AUTHOR
+	if (!peer->name_received) {
+		if (incoming.type != CLIENT_NAME)
+			return -1;
+		peer->name = incoming.payload;
+		peer->name_received = true;
+		for (chat_peer *other : server->peers) {
+			if (other == peer || !other->name_received)
+				continue;
+			if (!queue_frame(peer, NEW_CLIENT, other->id, other->name) ||
+				!queue_frame(other, NEW_CLIENT, peer->id, peer->name))
+				return -1;
+		}
+		for (const auto& pending : peer->pending_messages) {
+			if (!queue_frame(peer, MESSAGE, pending.first, pending.second))
+				return -1;
+		}
+		peer->pending_messages.clear();
+		return 0;
+	}
+#endif
 
-	epoll_event ev;
-	ev.data.ptr = p;
-	ev.events = EPOLLIN;
-	if (epoll_ctl(server->epoll_desk, EPOLL_CTL_ADD, peer_sock, &ev) == -1) {
-		printf("error = %s\n", strerror(errno));
-		close(peer_sock);
-		delete p;
+	if (incoming.type != MESSAGE)
+		return -1;
+	broadcast_message(server, peer, incoming.payload);
+	return 0;
+}
+
+static int
+parse_peer_input(chat_server *server, chat_peer *peer)
+{
+	frame incoming;
+	while (take_frame(&peer->input_buffer, &incoming)) {
+		if (handle_peer_frame(server, peer, incoming) < 0)
+			return -1;
+	}
+	return 0;
+}
+
+static int
+receive_from_peer(chat_server *server, chat_peer *peer, bool *has_data)
+{
+	char buffer[IO_BUFFER_SIZE];
+	while (true) {
+		ssize_t received = recv(peer->socket, buffer, sizeof(buffer), 0);
+		if (received > 0) {
+			*has_data = true;
+			peer->input_buffer.append(buffer, static_cast<size_t>(received));
+			continue;
+		}
+		if (received == 0)
+			return 1;
+		if (errno == EINTR)
+			continue;
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			break;
+		return -1;
+	}
+	return parse_peer_input(server, peer) < 0 ? -1 : 0;
+}
+
+static int
+flush_peer(chat_peer *peer, bool *has_data)
+{
+	while (!peer->output_buffer.empty()) {
+		ssize_t sent = send(peer->socket, peer->output_buffer.data(),
+			peer->output_buffer.size(), 0);
+		if (sent > 0) {
+			*has_data = true;
+			peer->output_buffer.erase(0, static_cast<size_t>(sent));
+			continue;
+		}
+		if (sent == -1 && errno == EINTR)
+			continue;
+		if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			return 0;
+		return -1;
+	}
+	return 0;
+}
+
+static int
+create_peer(chat_server *server, int peer_socket)
+{
+	if (set_nonblocking(peer_socket) == -1) {
+		close(peer_socket);
+		return -1;
+	}
+
+	auto *peer = new chat_peer();
+	peer->socket = peer_socket;
+	peer->id = server->next_client_id++;
+	if (peer->id == 0)
+		peer->id = server->next_client_id++;
+
+	struct epoll_event event{};
+	event.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
+	event.data.ptr = peer;
+	if (epoll_ctl(server->epoll_descriptor, EPOLL_CTL_ADD,
+		peer_socket, &event) == -1) {
+		close(peer_socket);
+		delete peer;
 		return -1;
 	}
 
 #if NEED_AUTHOR
-	auto statId = sendClientIdMsg( p);
-	if(statId < 0){
-		close_peer(server, p);
+	if (!queue_frame(peer, CLIENT_ID, peer->id, {})) {
+		epoll_ctl(server->epoll_descriptor, EPOLL_CTL_DEL,
+			peer_socket, nullptr);
+		close(peer_socket);
+		delete peer;
 		return -1;
 	}
-	auto statName = recieveClientName(p);
-	if(statName < 0){
-		close_peer(server, p);
-		return -1;
+	for (chat_peer *other : server->peers) {
+		if (other->name_received &&
+			!queue_frame(peer, NEW_CLIENT, other->id, other->name)) {
+			epoll_ctl(server->epoll_descriptor, EPOLL_CTL_DEL,
+				peer_socket, nullptr);
+			close(peer_socket);
+			delete peer;
+			return -1;
+		}
 	}
-	
-	for (chat_peer *existing : server->peers) {
-		char old_id_buf[5];
-		snprintf(old_id_buf, sizeof(old_id_buf), "%04d", existing->socket);
-		std::string old_cli_packet(1, static_cast<char>(chat_msg_type::NEW_CLIENT));
-		old_cli_packet += std::string(old_id_buf) + existing->name + '\n';
-		p->out_buffer += old_cli_packet;
-	}
-	if (!p->out_buffer.empty()) {
-		ev.events = EPOLLIN | EPOLLOUT;
-		epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, p->socket, &ev);
-	}
-
-	sendNewClientMsg(server, p);
+#else
+	peer->name_received = true;
 #endif
 
-	server->peers.insert(p);
-	int flags = fcntl(peer_sock, F_GETFL, 0);
-	fcntl(peer_sock, F_SETFL, flags | O_NONBLOCK);
+	server->peers.insert(peer);
 	return 0;
 }
 
 static void
-handleNewClientConnection(chat_server *server, bool *has_data)
+accept_all(chat_server *server, bool *has_data)
 {
 	while (true) {
-		int peer_sock = accept(server->socket, NULL, NULL);
-		if (peer_sock == -1) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				break; 
-			}
-			printf("error = %s\n", strerror(errno));
-			break;
+		int peer_socket = accept(server->socket, nullptr, nullptr);
+		if (peer_socket == -1) {
+			if (errno == EINTR)
+				continue;
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				return;
+			return;
 		}
-		
-		auto status = createNewClient(peer_sock, server);
-		if(status < 0) break;
-		*has_data = true;
+		if (create_peer(server, peer_socket) == 0)
+			*has_data = true;
 	}
 }
 
 static void
-sendClientsDataToClients(chat_server *server, chat_peer *p, bool *has_data, bool *drop_client)
+process_server_messages(chat_server *server, bool *has_data)
 {
-	ssize_t sent = send(p->socket, p->out_buffer.c_str(), p->out_buffer.size(), 0);
-	if (sent > 0) {
+	while (!server->server_messages.empty()) {
+		std::string message = std::move(server->server_messages.front());
+		server->server_messages.pop();
+		broadcast_message(server, nullptr, message);
 		*has_data = true;
-		p->out_buffer.erase(0, sent);
-	} else if (sent == -1 && errno != EAGAIN && errno != EWOULDBLOCK) *drop_client = true;
-
-	if(p->out_buffer.empty() && !*drop_client){
-		struct epoll_event ev;
-		memset(&ev, 0, sizeof(ev));
-		ev.events = EPOLLIN;
-		ev.data.ptr = p;
-		epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, p->socket, &ev);
 	}
 }
 
-static void
-sendServerDataToClients(chat_server *server)
-{
-	while (!server->input_buffer.empty()) {
-		std::string fed_msg = std::move(server->input_buffer.front());
-		server->input_buffer.pop();
-		
-		if (!server->peers.empty()) {
-			for (chat_peer *item : server->peers) {
-				item->out_buffer.append(fed_msg);
-				struct epoll_event ev;
-				memset(&ev, 0, sizeof(ev));
-				ev.events = EPOLLIN | EPOLLOUT;
-				ev.data.ptr = item;
-				epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, item->socket, &ev);
-			}
-		}
-	}
-}
-
-/*
- * 1) Wait on epoll/kqueue/poll for update on any socket.
- * 2) Handle the update.
- * 2.1) If the update was on listen-socket, then you probably need to
- *     call accept() on it - a new client wants to join.
- * 2.2) If the update was on a client-socket, then you might want to
- *     read/write on it.
- */
 int
 chat_server_update(struct chat_server *server, double timeout)
 {
-	if(!server || server->socket == -1) return CHAT_ERR_NOT_STARTED;
+	if (!server || server->socket == -1)
+		return CHAT_ERR_NOT_STARTED;
 
-	int ms = timeout * 1000;
-	struct epoll_event events[MAX_EVENTS];
-	int nfds = epoll_wait(server->epoll_desk, events, MAX_EVENTS, ms);
-	if (nfds == -1) {
+	struct epoll_event events[EPOLL_EVENT_LIMIT];
+	int event_count = epoll_wait(server->epoll_descriptor, events,
+		EPOLL_EVENT_LIMIT, timeout_to_milliseconds(timeout));
+	if (event_count == -1) {
+		if (errno == EINTR)
+			return CHAT_ERR_TIMEOUT;
 		return CHAT_ERR_SYS;
 	}
-	bool has_data{};
 
-	for(int i = 0; i < nfds; ++i){
-		if (events[i].data.ptr == NULL) {
-			handleNewClientConnection(server, &has_data);
+	bool has_data = false;
+	std::unordered_set<chat_peer *> to_drop;
+	for (int index = 0; index < event_count; ++index) {
+		if (events[index].data.ptr == nullptr) {
+			accept_all(server, &has_data);
 			continue;
 		}
 
-		chat_peer *p = static_cast<chat_peer *>(events[i].data.ptr);
-		bool drop_client{};
+		auto *peer = static_cast<chat_peer *>(events[index].data.ptr);
+		if (server->peers.find(peer) == server->peers.end() ||
+			to_drop.find(peer) != to_drop.end())
+			continue;
 
-		if(events[i].events & EPOLLIN){
-			int rc = communicate(server, p);
-			if (rc == -1) {
-				if (errno != EWOULDBLOCK && errno != EAGAIN) {
-					printf("error = %s\n", strerror(errno));
-					drop_client = true;
-				}
-			} else {
-				has_data = true;
-			}
+		uint32_t flags = events[index].events;
+		if (flags & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))
+			to_drop.insert(peer);
+		if (to_drop.find(peer) == to_drop.end() && (flags & EPOLLIN)) {
+			int status = receive_from_peer(server, peer, &has_data);
+			if (status != 0)
+				to_drop.insert(peer);
 		}
-
-		if(!drop_client && !p->out_buffer.empty()){
-			sendClientsDataToClients(server, p, &has_data, &drop_client);
-		}
-
-		if(drop_client) {
-			close_peer(server, p);
-			has_data = true;
+		if (to_drop.find(peer) == to_drop.end() && (flags & EPOLLOUT)) {
+			if (flush_peer(peer, &has_data) < 0)
+				to_drop.insert(peer);
 		}
 	}
 
-	sendServerDataToClients(server);
+	process_server_messages(server, &has_data);
+	for (chat_peer *peer : to_drop)
+		close_peer(server, peer);
 
-	if (nfds == 0 && !has_data) {
+	std::vector<chat_peer *> output_errors;
+	for (chat_peer *peer : server->peers) {
+		if (!peer->output_buffer.empty() &&
+			flush_peer(peer, &has_data) < 0)
+			output_errors.push_back(peer);
+	}
+	for (chat_peer *peer : output_errors)
+		close_peer(server, peer);
+
+	if (event_count == 0 && !has_data)
 		return CHAT_ERR_TIMEOUT;
-	}
-	
 	return 0;
 }
 
-/*
- * Server has multiple sockets - own and from connected clients. Hence
- * you can't return a socket here. But if you are using epoll/kqueue,
- * then you can return their descriptor. These descriptors can be polled
- * just like sockets and will return an event when any of their owned
- * descriptors has any events.
- *
- * For example, assume you created an epoll descriptor and added to
- * there a listen-socket and a few client-sockets. Now if you will call
- * poll() on the epoll's descriptor, then on return from poll() you can
- * be sure epoll_wait() can return something useful for some of those
- * sockets.
- */
 int
 chat_server_get_descriptor(const struct chat_server *server)
 {
-	if(!server) return -1;
-	return server->epoll_desk;
+	return server ? server->epoll_descriptor : -1;
 }
 
 int
 chat_server_get_socket(const struct chat_server *server)
 {
-	return server->socket;
+	return server ? server->socket : -1;
 }
 
 int
 chat_server_get_events(const struct chat_server *server)
 {
-	if(!server || server->epoll_desk == -1) return 0;
+	if (!server || server->epoll_descriptor == -1)
+		return 0;
 	return CHAT_EVENT_INPUT;
 }
 
 int
 chat_server_feed(struct chat_server *server, const char *msg, uint32_t msg_size)
 {
-	if(!server || server->epoll_desk == -1) return CHAT_ERR_NOT_STARTED;
-	if(!msg || msg_size <= 0) return 0;
+	if (!server || server->socket == -1)
+		return CHAT_ERR_NOT_STARTED;
+	if (!msg || msg_size == 0)
+		return 0;
 
-#if NEED_AUTHOR
-	std::string buf(msg, msg_size);
-	size_t start_pos = 0;
-	size_t pos;
-	std::string full_packet = "";
-
-	while ((pos = buf.find('\n', start_pos)) != std::string::npos) {
-		if (server->is_start_of_line) {
-			full_packet += static_cast<char>(chat_msg_type::MESSAGE) + std::to_string(1);
-		}
-		
-		full_packet += buf.substr(start_pos, pos - start_pos) + "\n";
-		server->is_start_of_line = true;
-		start_pos = pos + 1;
+	server->partial_server_feed.append(msg, msg_size);
+	size_t newline;
+	while ((newline = server->partial_server_feed.find('\n')) !=
+		std::string::npos) {
+		std::string_view line(server->partial_server_feed.data(), newline);
+		line = trim_message(line);
+		if (!line.empty())
+			server->server_messages.emplace(line);
+		server->partial_server_feed.erase(0, newline + 1);
 	}
-	if (start_pos < buf.size()) {
-		if (server->is_start_of_line) {
-			full_packet += static_cast<char>(chat_msg_type::MESSAGE) + std::to_string(1);
-		}
-		full_packet += buf.substr(start_pos);
-		server->is_start_of_line = false;
-	}
-
-	server->input_buffer.push(full_packet);
-#else
-	std::string full_packet(msg, msg_size);
-	server->input_buffer.push(full_packet);
-#endif
-
 	return 0;
 }
