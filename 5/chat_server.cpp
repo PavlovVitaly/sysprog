@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <unistd.h>
 #include <unordered_set>
 #include <arpa/inet.h> 
@@ -53,12 +54,34 @@ close_server(chat_server *server)
 	if(server->epoll_desk != -1) close(server->epoll_desk);
 }
 
+#if NEED_AUTHOR
+static void
+sendDropClientMsg(chat_server *server, int id){
+	char id_buf[8];
+	snprintf(id_buf, sizeof(id_buf), "%04d", id);
+	std::string data(1, static_cast<char>(chat_msg_type::DROP_CLIENT));
+	data += std::string(id_buf) + '\n';
+
+	for (chat_peer *item : server->peers) {
+		item->out_buffer += data;
+		struct epoll_event ev;
+		memset(&ev, 0, sizeof(ev));
+		ev.events = EPOLLIN | EPOLLOUT;
+		ev.data.ptr = item;
+		epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, item->socket, &ev);
+	}
+}
+#endif
+
 static void
 close_peer(chat_server *server, chat_peer *peer)
 {
 	if(!peer) return;
 	epoll_ctl(server->epoll_desk, EPOLL_CTL_DEL, peer->socket, NULL);
 	server->peers.erase(peer);
+#if NEED_AUTHOR
+	sendDropClientMsg(server, peer->socket);
+#endif
 	delete peer;
 }
 
@@ -132,11 +155,18 @@ chat_server_pop_next(struct chat_server *server)
 	auto* res = server->output_buffer.front().release();
 	server->output_buffer.pop();
 #if NEED_AUTHOR
-	auto tmp = res->data;
-	size_t pos{};
-	if ((pos = tmp.find(":%:")) != std::string::npos){
-		res->author = tmp.substr(0, pos);
-		res->data = tmp.substr(pos + 3);
+	std::string tmp = res->data;
+	if (!tmp.empty() && static_cast<chat_msg_type>(tmp[0]) == chat_msg_type::MESSAGE) {
+		try {
+			int id = std::stoi(tmp.substr(1, 4));
+			for (chat_peer *p : server->peers) {
+				if (p->socket == id) {
+					res->author = p->name;
+					break;
+				}
+			}
+			res->data = tmp.substr(5);
+		} catch (...) {}
 	}
 #endif
 	return res;
@@ -185,13 +215,60 @@ communicate(chat_server *server, chat_peer *p)
 	return 0;
 }
 
+#if NEED_AUTHOR
+static int
+sendClientIdMsg(chat_peer *client){
+	char id_buf[8];
+	snprintf(id_buf, sizeof(id_buf), "%04d", client->socket);
+	std::string data(1, static_cast<char>(chat_msg_type::CLIENT_ID));
+	data += std::string(id_buf) + '\n';
+
+	int sent = send(client->socket, data.c_str(), data.size(), 0);			
+	if (sent < 0 && !(errno == EAGAIN || errno == EWOULDBLOCK)) {
+		return -1;
+	}
+	return 0;
+}
+
+static void
+sendNewClientMsg(chat_server *server, chat_peer *client){
+	char id_buf[8];
+	snprintf(id_buf, sizeof(id_buf), "%04d", client->socket);
+
+	std::string data(1, static_cast<char>(chat_msg_type::NEW_CLIENT));
+	data += std::string(id_buf) + client->name + '\n';
+
+	for (chat_peer *item : server->peers) {
+		if (item == client) continue;
+		item->out_buffer += data;
+		struct epoll_event ev;
+		memset(&ev, 0, sizeof(ev));
+		ev.events = EPOLLIN | EPOLLOUT;
+		ev.data.ptr = item;
+		epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, item->socket, &ev);
+	}
+}
+
+static int
+recieveClientName(chat_peer *client){
+	size_t buf_size = 4096;
+	char buf[buf_size];
+	ssize_t sz = recv(client->socket, buf, buf_size, 0); 
+	if (sz <= 1) {
+		return -1;
+	}
+	// todo: что если имя больше размера буфера?
+	client->name = std::string(buf + 1, sz - 1);
+	return 0;
+}
+#endif
+
 static int
 createNewClient(int peer_sock, chat_server *server)
 {
-	int flags = fcntl(peer_sock, F_GETFL, 0);
-	fcntl(peer_sock, F_SETFL, flags | O_NONBLOCK);
-
 	chat_peer *p = new chat_peer;
+	p->socket = peer_sock;
+
 	epoll_event ev;
 	ev.data.ptr = p;
 	ev.events = EPOLLIN;
@@ -201,8 +278,37 @@ createNewClient(int peer_sock, chat_server *server)
 		delete p;
 		return -1;
 	}
-	p->socket = peer_sock;
+
+#if NEED_AUTHOR
+	auto statId = sendClientIdMsg( p);
+	if(statId < 0){
+		close_peer(server, p);
+		return -1;
+	}
+	auto statName = recieveClientName(p);
+	if(statName < 0){
+		close_peer(server, p);
+		return -1;
+	}
+	
+	for (chat_peer *existing : server->peers) {
+		char old_id_buf[5];
+		snprintf(old_id_buf, sizeof(old_id_buf), "%04d", existing->socket);
+		std::string old_cli_packet(1, static_cast<char>(chat_msg_type::NEW_CLIENT));
+		old_cli_packet += std::string(old_id_buf) + existing->name + '\n';
+		p->out_buffer += old_cli_packet;
+	}
+	if (!p->out_buffer.empty()) {
+		ev.events = EPOLLIN | EPOLLOUT;
+		epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, p->socket, &ev);
+	}
+
+	sendNewClientMsg(server, p);
+#endif
+
 	server->peers.insert(p);
+	int flags = fcntl(peer_sock, F_GETFL, 0);
+	fcntl(peer_sock, F_SETFL, flags | O_NONBLOCK);
 	return 0;
 }
 
@@ -246,17 +352,19 @@ sendClientsDataToClients(chat_server *server, chat_peer *p, bool *has_data, bool
 static void
 sendServerDataToClients(chat_server *server)
 {
-	while (!server->input_buffer.empty() && !server->peers.empty()) {
+	while (!server->input_buffer.empty()) {
 		std::string fed_msg = std::move(server->input_buffer.front());
 		server->input_buffer.pop();
 		
-		for (chat_peer *item : server->peers) {
-			item->out_buffer.append(fed_msg);
-			struct epoll_event ev;
-			memset(&ev, 0, sizeof(ev));
-			ev.events = EPOLLIN | EPOLLOUT;
-			ev.data.ptr = item;
-			epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, item->socket, &ev);
+		if (!server->peers.empty()) {
+			for (chat_peer *item : server->peers) {
+				item->out_buffer.append(fed_msg);
+				struct epoll_event ev;
+				memset(&ev, 0, sizeof(ev));
+				ev.events = EPOLLIN | EPOLLOUT;
+				ev.data.ptr = item;
+				epoll_ctl(server->epoll_desk, EPOLL_CTL_MOD, item->socket, &ev);
+			}
 		}
 	}
 }
@@ -339,8 +447,6 @@ int
 chat_server_get_descriptor(const struct chat_server *server)
 {
 	if(!server) return -1;
-//#if NEED_SERVER_FEED
-//#endif
 	return server->epoll_desk;
 }
 
@@ -371,7 +477,7 @@ chat_server_feed(struct chat_server *server, const char *msg, uint32_t msg_size)
 
 	while ((pos = buf.find('\n', start_pos)) != std::string::npos) {
 		if (server->is_start_of_line) {
-			full_packet += "server:%:";
+			full_packet += static_cast<char>(chat_msg_type::MESSAGE) + std::to_string(1);
 		}
 		
 		full_packet += buf.substr(start_pos, pos - start_pos) + "\n";
@@ -380,7 +486,7 @@ chat_server_feed(struct chat_server *server, const char *msg, uint32_t msg_size)
 	}
 	if (start_pos < buf.size()) {
 		if (server->is_start_of_line) {
-			full_packet += "server:%:";
+			full_packet += static_cast<char>(chat_msg_type::MESSAGE) + std::to_string(1);
 		}
 		full_packet += buf.substr(start_pos);
 		server->is_start_of_line = false;

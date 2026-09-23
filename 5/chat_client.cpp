@@ -70,6 +70,7 @@ void parse_addr(std::string_view addr, std::string& ip, std::string& port)
 	port = "80";
 }
 
+#if NEED_AUTHOR
 static int
 sendClientName(chat_client *client)
 {
@@ -80,6 +81,7 @@ sendClientName(chat_client *client)
 	if (sent < 0) return -1;
 	return 0;
 }
+#endif
 
 static int parseData(chat_client *client){
 	size_t pos;
@@ -91,7 +93,11 @@ static int parseData(chat_client *client){
 				auto msg = std::make_unique<chat_message>();
 				try {
 				    int id = std::stoi(client->partial_input.substr(1, 4));
-					msg->author = client->other_clients.at(id);
+					if(id == 1){
+						msg->author = "server";
+					} else {
+						msg->author = client->other_clients[id];
+					}
 				} catch (...) {
 					return -1;
 				}
@@ -141,6 +147,7 @@ static int parseData(chat_client *client){
 	return 0;
 }
 
+#if NEED_AUTHOR
 static int
 recieveClientId(chat_client *client)
 {
@@ -162,6 +169,7 @@ recieveClientId(chat_client *client)
 
 	return 0;
 }
+#endif
 
 /*
  * 1) Use getaddrinfo() to resolve addr to struct sockaddr_in.
